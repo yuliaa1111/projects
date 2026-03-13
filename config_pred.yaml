@@ -1,0 +1,62 @@
+task:
+  mode: "predict"
+  type: "regression"
+  label_col: "y"
+  seed: 42
+
+logging:
+  level: INFO   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_dir: "{runs_root}/{run_id}/logs/predict"  
+  filename: "predict.log"
+  max_bytes: 5242880      
+  backup_count: 100
+  fmt: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  console: true
+
+paths:
+  runs_root: "/Users/yulia/Desktop/clickhouse/runs"
+  run_id: "exp003"                 #<-- 实验编号要和train一致
+
+dataloader:
+  source: "parquet_dir"
+  date_col: "date"
+  stockid_col: "stockid"
+  long_filename: "/Users/yulia/Desktop/clickhouse/testdata_20240617.parquet"
+  fields: []
+  label_name: "y"
+  date_start: "2024-06-17"
+  date_end:   "2024-06-17"
+
+  feature_mask_csv: "/Users/yulia/Desktop/clickhouse/field_mask.csv"
+  feature_col_name: "feature"
+  feature_use_col: "use"
+
+  build_label: false   # predict: 不需要 y
+  label_price_col: "open_1d"
+  label_log_return: false
+
+preprocess:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+
+  col_drop_threshold: 1.01   # 不 drop
+  row_drop_threshold: 1.01
+
+  nan_policy: "tree_friendly"
+  do_fill_for_tree: false
+  fill_method: "ffill_then_zero"
+  ffill_limit: 5
+
+  save_path: "{runs_root}/preprocess/preprocessed_pred_{date_start}_{date_end}.parquet"
+
+model:
+  family: "tree"
+  name: "lgbm"
+
+predict:
+  asof_date: "2024-06-17"
+  target_date: "2024-06-18"
+  bundle_dir: "{model_dir}"
+  out_path: "{pred_infer_dir}/pred_{target_date}.parquet"

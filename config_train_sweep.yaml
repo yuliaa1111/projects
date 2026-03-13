@@ -1,0 +1,403 @@
+task:
+  mode: "train" # "train" | "predict"
+  type: "regression"
+  label_col: "y"
+  seed: 42
+
+logging:
+  level: INFO
+  log_dir: "{run_dir}/logs"
+  filename: "train.log"
+  max_bytes: 10485760
+  backup_count: 100
+  fmt: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  console: true
+
+paths:
+  runs_root: "/Users/yulia/Desktop/clickhouse/runs"
+  run_id: "exp001_sweep"                  # 建议单独一个实验ID，避免覆盖原 rolling 结果
+  run_dir: "{runs_root}/{run_id}"
+  preprocess_dir: "{run_dir}/preprocess"
+  model_dir: "{run_dir}/model"
+  pred_dir: "{run_dir}/preds"
+  eval_dir: "{run_dir}/eval"
+
+dataloader:
+  source: "parquet_dir"
+  date_col: "date"
+  stockid_col: "stockid"
+  long_filename: "/Users/yulia/Desktop/clickhouse/testdata_0101_0614.parquet"
+  fields: []
+  label_name: "y"
+  date_start: "2024-06-01"
+  date_end:   "2024-06-14"
+
+  feature_mask_csv: "/Users/yulia/Desktop/clickhouse/field_mask.csv"
+  feature_col_name: "feature"
+  feature_use_col: "use"
+
+  build_label: true
+  label_price_col: "open_1d"
+  label_log_return: false
+
+preprocess:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+
+  col_drop_threshold: 0.20
+  row_drop_threshold: 0.20
+
+  nan_policy: "tree_friendly"
+  do_fill_for_tree: false
+  fill_method: "ffill_then_zero"
+  ffill_limit: 5
+
+  add_missing_mask: false
+
+  winsorize:
+    enabled: true
+    by: "date"
+    lower_q: 0.01
+    upper_q: 0.99
+
+  zscore:
+    enabled: false
+    by: "date"
+    ddof: 0
+    clip: null
+
+  save_parquet: true
+  save_path: "{preprocess_dir}/preprocessed_{mode}_{label}_{date_start}_{date_end}.parquet"
+  save_state_json: true
+  state_path: "{model_dir}/preprocess_state_fit_{label}_{date_start}_{date_end}.json"
+
+datasplit:
+  strategy: "step_then_ratio"
+  window_ratio: 0.7
+  min_window_dates: 5
+  step_ratio: 0.07
+  train_ratio: 0.9        # 改为 0.9
+  valid_ratio: 0.0        # 关闭 valid
+  test_ratio: 0.1         # 保持 test 10%
+  return_dfs: false
+
+datacutting:
+  mode: "tree"
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+  weight_col: null
+  feature_cols: null
+  return_dataframe_X: true
+
+  cache:
+    enabled: false
+    mode: "parquet_long"
+    dir: "{run_dir}/cut"
+    file_tpl: "{model}_{part}_fold{fold}.parquet"
+    meta_tpl: "{model}_{part}_fold{fold}_meta.json"
+    npz_tpl: "{model}_{part}_fold{fold}.npz"
+    keys_tpl: "{model}_{part}_fold{fold}_keys.parquet"
+
+  seq_len: 60
+  incomplete_policy: "drop"
+  pad_side: "left"
+  min_len_to_keep: 1
+  return_mask: true
+  mask_dtype: "bool"
+  strict_check_nan: false
+
+
+# -------------------------
+# model: 这里可以保留 candidates，sweep 里会覆盖具体 params
+# -------------------------
+model:
+  family: "tree"
+  name: "lgbm"
+
+  candidates:
+    lgbm:
+      verbosity: -1
+      objective: "regression"
+      n_estimators: 800
+      learning_rate: 0.05
+      num_leaves: 63
+      max_depth: -1
+      min_data_in_leaf: 200
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      min_gain_to_split: 0.0
+      random_state: 42
+      n_jobs: -1
+
+    xgb:
+      objective: "reg:squarederror"
+      n_estimators: 500
+      learning_rate: 0.05
+      max_depth: 6
+      tree_method: "hist"
+      random_state: 42
+      n_jobs: -1
+
+    catboost:
+      loss_function: "RMSE"
+      iterations: 2000
+      learning_rate: 0.05
+      depth: 6
+      random_seed: 42
+      verbose: false
+
+
+trainer:
+  name: "sweep_rolling"             
+  params:
+    metric: "rankic"
+    maximize: true
+
+    date_col: "date"
+    stockid_col: "stockid"
+    device: "auto"                  
+    task: "regression"
+
+    loss:
+      enabled: true
+      name: "mse"
+
+    # sweep模式不需要 schedule/tuner/update_gate（都关掉或删除）
+    # schedule 删除
+    tuner:
+      enabled: false                 # 必须关掉
+    update_gate: null                # 关掉更新门槛
+
+    # 保存预测与真实值：只保存 train/test
+    saver:
+      enabled: true
+      params:
+        dir: "{pred_dir}"
+        save_parts: ["train","test"] # 去掉 valid
+        file_tpl: "step{step_id}_fold{fold}_{part}.parquet"
+
+    model_save:
+      enabled: true
+      strategy: "last"
+      out_dir: "{run_dir}/sweeps/{param_id}/model"
+      filename: "model.pkl"
+
+
+
+# sweep 参数集合
+sweep:
+  param_sets:
+    - id: lgbm_01
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 800
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 200
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_02
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 800
+          num_leaves: 31
+          max_depth: 6
+          min_data_in_leaf: 400
+          feature_fraction: 0.7
+          bagging_fraction: 0.7
+          bagging_freq: 1
+          lambda_l2: 5.0
+          min_gain_to_split: 0.1
+
+    - id: lgbm_03
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.03
+          n_estimators: 1500
+          num_leaves: 127
+          max_depth: -1
+          min_data_in_leaf: 80
+          feature_fraction: 0.9
+          bagging_fraction: 0.9
+          bagging_freq: 1
+          lambda_l2: 0.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_04
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 1200
+          num_leaves: 63
+          max_depth: 4
+          min_data_in_leaf: 200
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_05
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.01
+          n_estimators: 4000
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 200
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_06
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 1200
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 150
+          feature_fraction: 0.6
+          bagging_fraction: 0.6
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_07
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 1200
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 150
+          feature_fraction: 0.5
+          bagging_fraction: 0.85
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_08
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 1200
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 200
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 1.0
+          min_gain_to_split: 0.2
+
+    - id: lgbm_09
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.05
+          n_estimators: 1200
+          num_leaves: 63
+          max_depth: -1
+          min_data_in_leaf: 250
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 10.0
+          min_gain_to_split: 0.0
+
+    - id: lgbm_10
+      model:
+        family: "tree"
+        name: "lgbm"
+        params:
+          learning_rate: 0.03
+          n_estimators: 2000
+          num_leaves: 127
+          max_depth: -1
+          min_data_in_leaf: 300
+          feature_fraction: 0.8
+          bagging_fraction: 0.8
+          bagging_freq: 1
+          lambda_l2: 5.0
+          min_gain_to_split: 0.1
+
+
+evaluate:
+  name: "default"
+  params:
+    task: "regression"
+    pred_dir: "{pred_dir}"
+    out_dir: "{eval_dir}"
+    save_fig: true
+    parts: ["train", "test"]         # 去掉 valid
+    date_col: "date"
+    daily_agg: "mean"
+    q_bins: 10
+    regression:
+      metrics: ["rankic", "icir", "mse", "mae", "r2"]
+      ic_method: "spearman"
+    max_files: null
+    return_pred_df: false
+    stitch_regression: true
+    stitch_keep_individual: true
+    stitch_filename: "regression_all_plots_long.png"
+
+
+sweep_compare:
+  enabled: true
+  summary_path: "{run_dir}/sweeps/sweep_summary.parquet"
+  out_dir: "{eval_dir}/sweep_compare"
+  # 每张 long 图有多少个 panel（目前是8）
+  n_panels: 8
+  # 要对比的 panel 索引
+  # 0=train quantile
+  # 1=test quantile
+  # 2=mean return by quantile
+  # 3=rankic distribution
+  # 4=residual distribution
+  # 5=residual daily
+  # 6=scatter
+  # 7=daily true vs pred
+  panel_idxs: [1,2,3,6]
+  sort_by: "rankic"    # 排序指标（test 部分）
+  make_metric_bar: true      # 生成柱状图
+  make_panel_compare: true   # 拼接图
+
+
+post_train_predict:
+  enabled: false                    
+  asof_date: "2024-06-14"
+  target_date: "2024-06-17"
+  out_path: "{pred_dir}_infer/pred_{target_date}.parquet"

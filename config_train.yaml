@@ -1,0 +1,312 @@
+task:
+  mode: "train" # "train" | "predict"
+  type: "regression"
+  label_col: "y"
+  seed: 42
+
+logging:
+  level: INFO   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_dir: "{run_dir}/logs/train"  
+  filename: "train.log"
+  max_bytes: 10485760
+  backup_count: 100
+  fmt: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  console: true
+
+
+paths:
+  runs_root: "/Users/yulia/Desktop/clickhouse/runs"
+  run_id: "exp003"                   #<-- 修改实验编号
+  run_dir: "{runs_root}/{run_id}"
+  preprocess_dir: "{run_dir}/preprocess"
+  model_dir: "{run_dir}/model"
+  pred_dir: "{run_dir}/preds"
+  eval_dir: "{run_dir}/eval"
+
+dataloader:
+  source: "parquet_dir" 
+  date_col: "date"
+  stockid_col: "stockid"
+  long_filename: "/Users/yulia/Desktop/clickhouse/testdata_0101_0614.parquet"
+  fields: []
+  label_name: "y"
+  date_start: "2024-06-01"
+  date_end:   "2024-06-14"
+
+  # ===== 因子筛选 =====
+  feature_mask_csv: "/Users/yulia/Desktop/clickhouse/field_mask.csv" # or null
+  feature_col_name: "feature"   # 如果你的 CSV 是纵表 (feature/use)
+  feature_use_col: "use"
+  # ===== 构建 label =====
+  build_label: true            # train时候必须打开 true，predict 时 false
+  label_price_col: "open_1d"     # open-to-open
+  label_log_return: false        # 需要 log return 就改 true
+
+
+preprocess:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+
+  # drop 策略
+  col_drop_threshold: 0.20   # 某特征 NaN > 20% drop
+  row_drop_threshold: 0.20   # 某样本 NaN > 20% drop
+
+  # nan 策略
+  nan_policy: "tree_friendly"     # strict: 必须无 NaN（ridge/nn）｜ tree_friendly: 允许 NaN（lgbm/xgb）
+  do_fill_for_tree: false          # tree_friendly 下是否也做 fill（默认关）
+  fill_method: "ffill_then_zero"  # zero | ffill_then_zero：短期前向填充后补0 | ffill_all=无限前向填充，起点可为NaN（仅tree_friendly可用）
+  ffill_limit: 5                  # 每只股票最多连续 ffill 5 天
+
+  add_missing_mask: false
+
+  winsorize:
+    enabled: true
+    by: "date"        # "date" | "global"
+    lower_q: 0.01
+    upper_q: 0.99
+
+  zscore:
+    enabled: false
+    by: "date"        # "date" | "global"
+    ddof: 0
+    clip: null        # 比如 5.0，可把zscore再clip到[-5,5]
+
+  save_parquet: true
+  save_path: "{preprocess_dir}/preprocessed_{mode}_{label}_{date_start}_{date_end}.parquet"
+  save_state_json: true
+  state_path: "{model_dir}/preprocess_state_fit_{label}_{date_start}_{date_end}.json"
+
+datasplit:
+  strategy: "step_then_ratio"
+  window_ratio: 0.7
+  min_window_dates: 5  #最终窗口长度 = window_ratio和 min_window_dates两者取大，但不能超过总日期数 n。
+  step_ratio: 0.07
+  train_ratio: 0.7
+  valid_ratio: 0.2
+  test_ratio: 0.1
+  return_dfs: false     # 为了每次只读取训练窗口的preprocess parquet，这里需要关闭，否则datasplit_long 会在内存里为每一个 fold 生成并保存一整份 train/valid/test DataFrame，
+
+
+datacutting:
+  mode: "tree"                       # tree | seq 
+  date_col: "date"                 
+  stockid_col: "stockid"           
+  label_col: "y"                    
+  weight_col: null                 
+  feature_cols: null                # 可手动指定特征列；null=自动推断（数值列里排除 date/stockid/label/weight）
+  return_dataframe_X: true          # tree专用：true=payload["X"] 返回 DataFrame；false=返回 np.float32 ndarray
+
+  cache:                           # optional保存
+    enabled: false
+    mode: "parquet_long"            # parquet_long | parquet_xy —— long 表整存 or 分开存 X/y/keys/(w)
+    dir: "{run_dir}/cut"
+    file_tpl: "{model}_{part}_fold{fold}.parquet"    
+    meta_tpl: "{model}_{part}_fold{fold}_meta.json"  
+   
+    npz_tpl: "{model}_{part}_fold{fold}.npz"           # seq 用（tree 不管）
+    keys_tpl: "{model}_{part}_fold{fold}_keys.parquet" # 同上
+  # =========================
+  # Seq 专用（mode: seq）
+  # =========================
+  seq_len: 60                       
+  incomplete_policy: "drop"         # 历史不足（m < seq_len）时的处理策略：drop | pad_zero（用 0 padding 到 seq_len） | pad_repeat_first（第一行重复 padding）  
+  pad_side: "left"                  # left | right —— padding 在时间轴哪一侧
+  min_len_to_keep: 1                # 如果某股票历史长度 m < min_len_to_keep，则无论如何都 drop（即使 pad 策略也不留），用来过滤极短样本
+  return_mask: true                
+  mask_dtype: "bool"                # bool | float32
+  strict_check_nan: false           # true=发现 X 或 y 有 NaN 就直接报错
+
+
+
+model:
+  family: "tree"
+  name: "lgbm"
+
+  candidates:
+    lgbm:
+      verbosity: -1       # 1=输出详细信息和警告，0=只输出error，-1=完全静默
+      objective: "regression"
+      n_estimators: 800
+      learning_rate: 0.05
+
+      num_leaves: 63
+      max_depth: -1
+      min_data_in_leaf: 200
+
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      min_gain_to_split: 0.0
+
+      random_state: 42
+      n_jobs: -1
+
+    xgb:
+      objective: "reg:squarederror"
+      n_estimators: 500
+      learning_rate: 0.05
+      max_depth: 6
+      tree_method: "hist"
+      random_state: 42
+      n_jobs: -1
+
+    catboost:
+      loss_function: "RMSE"
+      iterations: 2000
+      learning_rate: 0.05
+      depth: 6
+      random_seed: 42
+      verbose: false
+
+
+trainer:
+  name: "rolling"
+  params:
+    metric: "rankic"  # turner调参是否更新参数的指标：rankic，icir, mse, mae, r2
+    maximize: true
+
+    date_col: "date"
+    stockid_col: "stockid"
+    device: "cpu"
+    task: "regression"
+
+    loss:
+      enabled: true
+      name: "mse"        # mse | mae | huber | quantile ...
+      # params:
+        # alpha: 0.9       #  huber | quantile
+
+    # nn_fit:
+    #   epochs: 5
+    #   lr: 0.001
+    #   batch_size: 256
+
+    schedule:
+      name: "every_k_steps"
+      params:
+        k: 4
+        offset: 0
+
+    tuner:
+      enabled: true
+      name: "grid_search"
+      params:
+        candidates_by_model:
+          lgbm:
+            # 1) baseline（中等复杂度）
+            - {learning_rate: 0.05, n_estimators: 800,  num_leaves: 63,  max_depth: -1, min_data_in_leaf: 200,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.0}
+
+            # 2) 更保守（强正则+更少叶子）
+            - {learning_rate: 0.05, n_estimators: 800,  num_leaves: 31,  max_depth: 6,  min_data_in_leaf: 400,
+               feature_fraction: 0.7, bagging_fraction: 0.7, bagging_freq: 1, lambda_l2: 5.0, min_gain_to_split: 0.1}
+
+            # 3) 更激进（更强拟合）
+            - {learning_rate: 0.03, n_estimators: 1500, num_leaves: 127, max_depth: -1, min_data_in_leaf: 80,
+               feature_fraction: 0.9, bagging_fraction: 0.9, bagging_freq: 1, lambda_l2: 0.0, min_gain_to_split: 0.0}
+
+            # 4) 深度受限（偏“浅树”）
+            - {learning_rate: 0.05, n_estimators: 1200, num_leaves: 63,  max_depth: 4,  min_data_in_leaf: 200,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.0}
+
+            # 5) 小学习率长跑（更稳）
+            - {learning_rate: 0.01, n_estimators: 4000, num_leaves: 63,  max_depth: -1, min_data_in_leaf: 200,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.0}
+
+            # 6) 更强 subsample（更抗噪）
+            - {learning_rate: 0.05, n_estimators: 1200, num_leaves: 63,  max_depth: -1, min_data_in_leaf: 150,
+               feature_fraction: 0.6, bagging_fraction: 0.6, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.0}
+
+            # 7) 更强 feature subsample（更抗共线）
+            - {learning_rate: 0.05, n_estimators: 1200, num_leaves: 63,  max_depth: -1, min_data_in_leaf: 150,
+               feature_fraction: 0.5, bagging_fraction: 0.85, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.0}
+
+            # 8) 更强分裂门槛（抑制过拟合）
+            - {learning_rate: 0.05, n_estimators: 1200, num_leaves: 63,  max_depth: -1, min_data_in_leaf: 200,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 1.0, min_gain_to_split: 0.2}
+
+            # 9) 更强 L2（很保守）
+            - {learning_rate: 0.05, n_estimators: 1200, num_leaves: 63,  max_depth: -1, min_data_in_leaf: 250,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 10.0, min_gain_to_split: 0.0}
+
+            # 10) 大叶子但更强叶子样本限制（折中）
+            - {learning_rate: 0.03, n_estimators: 2000, num_leaves: 127, max_depth: -1, min_data_in_leaf: 300,
+               feature_fraction: 0.8, bagging_fraction: 0.8, bagging_freq: 1, lambda_l2: 5.0, min_gain_to_split: 0.1}
+
+    update_gate:
+      name: "min_improve"
+      params:
+        min_improve: 0.002
+
+    # # tune 用随机搜参
+    # tuner:
+    #   enabled: true
+    #   name: "random_search"
+    #   params:
+    #     n_trials: 20
+    #     seed: 42
+
+    #     search_space_by_model:
+    #       lgbm:
+    #         learning_rate: [0.01, 0.03, 0.05, 0.1]
+    #         num_leaves: [31, 63, 127]
+
+    #       catboost:
+    #         learning_rate: [0.01, 0.03, 0.05, 0.1]
+    #         depth: [4, 6, 8, 10]
+    #         l2_leaf_reg: [1, 3, 10, 30]
+
+    #       xgb:
+    #         learning_rate: [0.01, 0.03, 0.05, 0.1]
+    #         max_depth: [3, 4, 6, 8]
+    #         min_child_weight: [1, 5, 10]
+    #         subsample: [0.7, 0.85, 1.0]
+    #         colsample_bytree: [0.7, 0.85, 1.0]
+    #         reg_lambda: [1, 5, 10]
+
+    # 保存预测与真实值
+    saver:
+      enabled: true
+      params:
+        dir: "{pred_dir}" 
+        save_parts: ["train","valid","test"]
+        file_tpl: "step{step_id}_fold{fold}_{part}.parquet"
+
+
+    model_save:
+      enabled: true
+      strategy: "last"                 # last | best_valid | best_valid_last_n
+      last_n: 5                        # strategy=best_valid_last_n 时用
+      out_dir: "{model_dir}"
+      filename: "model.pkl"
+
+
+evaluate:
+  name: "default"
+  params:
+    task: "regression"
+    pred_dir: "{pred_dir}"
+    out_dir: "{eval_dir}"
+    save_fig: true
+    parts: ["train", "valid", "test"]
+    date_col: "date"
+    daily_agg: "mean"
+    q_bins: 10
+    regression:
+      metrics: ["rankic", "icir", "mse", "mae", "r2"]
+      ic_method: "spearman"
+    max_files: null
+    return_pred_df: false
+
+
+post_train_predict:
+  enabled: true
+  asof_date: "2024-06-14"
+  target_date: "2024-06-17"
+  out_path: "{pred_dir}_infer/pred_{target_date}.parquet"
+
