@@ -63,6 +63,8 @@ import logging
 
 from ret_pred.paths import resolve_paths
 
+logger = logging.getLogger(__name__)
+
 
 # ======================================================
 # Helpers
@@ -105,6 +107,72 @@ def seed_all(seed: int) -> None:
     np.random.seed(seed)
 
 
+def _resolve_long_paths_from_dataloader(dl_cfg: Dict[str, Any]) -> List[Path]:
+    """
+    Resolve long parquet source paths from dataloader config.
+    """
+    long_paths = dl_cfg.get("long_paths")
+    if isinstance(long_paths, list) and len(long_paths) > 0:
+        return [Path(str(p)) for p in long_paths]
+
+    long_path = dl_cfg.get("long_path")
+    if long_path:
+        return [Path(str(long_path))]
+
+    long_filename = str(dl_cfg.get("long_filename", "long.parquet"))
+    if Path(long_filename).is_absolute():
+        return [Path(long_filename)]
+    return [Path(str(dl_cfg.get("parquet_dir", "./data"))) / long_filename]
+
+
+def _infer_base_pool_from_dataloader_schema(dl_cfg: Dict[str, Any], *, label_col: str) -> List[str]:
+    """
+    Infer numeric candidate factor pool from parquet schema.
+
+    Used when feature_mask_csv is null and dataloader.fields is empty.
+    """
+    import pandas as pd
+
+    date_col = str(dl_cfg.get("date_col", "date"))
+    stockid_col = str(dl_cfg.get("stockid_col", "stockid"))
+    exclude = {date_col, stockid_col, str(label_col), f"{label_col}_raw"}
+
+    out: List[str] = []
+    seen = set()
+
+    for p in _resolve_long_paths_from_dataloader(dl_cfg):
+        if not p.exists():
+            continue
+
+        cols: List[str] = []
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+
+            schema = pq.ParquetFile(p).schema_arrow
+            for f in schema:
+                t = f.type
+                if (
+                    pa.types.is_integer(t)
+                    or pa.types.is_floating(t)
+                    or pa.types.is_decimal(t)
+                    or pa.types.is_boolean(t)
+                ):
+                    cols.append(str(f.name))
+        except Exception:
+            # Fallback: keep non-key columns if schema typing is unavailable.
+            logger.warning("schema numeric inference fallback via pandas columns | path=%s", str(p))
+            cols = [str(c) for c in pd.read_parquet(p).columns]
+
+        for c in cols:
+            if c in exclude or c in seen:
+                continue
+            seen.add(c)
+            out.append(c)
+
+    return out
+
+
 def _collect_planning_dates_from_dataloader(dl_cfg: Dict[str, Any]) -> List[Any]:
     """
     Lightweight date scan for rankic_refit_roll pre-planning.
@@ -117,19 +185,10 @@ def _collect_planning_dates_from_dataloader(dl_cfg: Dict[str, Any]) -> List[Any]
     date_start = str(dl_cfg.get("date_start", ""))
     date_end = str(dl_cfg.get("date_end", ""))
 
-    long_paths = dl_cfg.get("long_paths")
-    if isinstance(long_paths, list) and len(long_paths) > 0:
-        p = Path(str(long_paths[0]))
-    else:
-        long_path = dl_cfg.get("long_path")
-        if long_path:
-            p = Path(str(long_path))
-        else:
-            long_filename = str(dl_cfg.get("long_filename", "long.parquet"))
-            if Path(long_filename).is_absolute():
-                p = Path(long_filename)
-            else:
-                p = Path(str(dl_cfg.get("parquet_dir", "./data"))) / long_filename
+    paths = _resolve_long_paths_from_dataloader(dl_cfg)
+    if len(paths) == 0:
+        return []
+    p = paths[0]
 
     if not p.exists():
         return []
@@ -264,13 +323,16 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 base_pool = filter_fields_by_mask(dl_req.fields, selected_mask)
             elif selected_mask is not None:
                 base_pool = list(selected_mask)
+            else:
+                # feature_mask_csv is null: infer candidate pool from parquet schema
+                base_pool = _infer_base_pool_from_dataloader_schema(dl, label_col=label_col)
 
             base_pool = list(dict.fromkeys([str(x) for x in base_pool]))
 
             if len(base_pool) == 0:
                 logger.warning(
                     "rankic preplan skipped: empty base candidate pool. "
-                    "Please set dataloader.feature_mask_csv or dataloader.fields."
+                    "Please check long_paths schema or set dataloader.fields explicitly."
                 )
             else:
                 planning_dates = _collect_planning_dates_from_dataloader(dl)
@@ -375,19 +437,23 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("preprocess parquet | path=%s", preprocess_path)
 
     # -------------------------
-    # C) datasplit（dates only）
+    # C) datasplit（dates only; only for rolling/sweep_rolling）
     # -------------------------
-    # 注意：split 只需要 date 序列，不需要全特征列
-    # 这样做可以减少在 split 阶段传递/复制大 df 的成本，并且让 split 逻辑更纯粹。
-    sp_cfg = dict(cfg.get("datasplit", {}))
-    sp_cfg["return_dfs"] = False
-    sp_cfg["save_parquet"] = False
+    folds = None
+    if tr_name in ("rolling", "sweep_rolling"):
+        # 注意：split 只需要 date 序列，不需要全特征列
+        # 这样做可以减少在 split 阶段传递/复制大 df 的成本，并且让 split 逻辑更纯粹。
+        sp_cfg = dict(cfg.get("datasplit", {}))
+        sp_cfg["return_dfs"] = False
+        sp_cfg["save_parquet"] = False
 
-    dates_df = clean_df[[dl_cfg.date_col]]
-    meta2 = dict(meta, preprocess_state=pp_state, run_id=paths.get("run_id"))
+        dates_df = clean_df[[dl_cfg.date_col]]
+        meta2 = dict(meta, preprocess_state=pp_state, run_id=paths.get("run_id"))
 
-    folds, _ = datasplit_long(dates_df, sp_cfg, meta=meta2)
-    logger.info("split done | folds=%d", len(folds))
+        folds, _ = datasplit_long(dates_df, sp_cfg, meta=meta2)
+        logger.info("split done | folds=%d", len(folds))
+    else:
+        logger.info("datasplit skipped | trainer=%s uses internal windowing", tr_name)
 
     # -------------------------
     # D) windows (streaming read from preprocess parquet)
@@ -414,6 +480,8 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # =====================================================
     if tr_name == "rolling":
         from ret_pred.trainer.rolling_trainer import RollingTrainer
+        if folds is None:
+            raise RuntimeError("internal error: folds is None for trainer=rolling")
 
         # windows 是 generator：每次 yield 一个 fold 的 train/valid/test payload
         # streaming 的关键：只在需要时读 preprocess parquet 的窗口范围
@@ -509,6 +577,8 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # =====================================================
     elif tr_name == "sweep_rolling":
         from ret_pred.trainer.sweep_trainer import SweepRollingTrainer
+        if folds is None:
+            raise RuntimeError("internal error: folds is None for trainer=sweep_rolling")
 
         sweep_cfg = dict(cfg.get("sweep", {}) or {})
         param_sets = sweep_cfg.get("param_sets") or []
