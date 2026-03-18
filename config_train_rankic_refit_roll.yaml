@@ -1,0 +1,205 @@
+task:
+  mode: "train"
+  type: "regression"
+  label_col: "y"
+  seed: 42
+
+logging:
+  level: INFO
+  log_dir: "{run_dir}/logs/train"
+  filename: "train.log"
+  max_bytes: 10485760
+  backup_count: 100
+  fmt: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  console: true
+
+paths:
+  runs_root: "/Users/yulia/Desktop/clickhouse/runs"
+  run_id: "exp_rankic_refit_roll_001"
+  run_dir: "{runs_root}/{run_id}"
+  preprocess_dir: "{run_dir}/preprocess"
+  model_dir: "{run_dir}/model"
+  pred_dir: "{run_dir}/preds"
+  eval_dir: "{run_dir}/eval"
+
+dataloader:
+  source: "parquet_dir"
+  date_col: "date"
+  stockid_col: "stockid"
+  long_filename: "/Users/yulia/Desktop/clickhouse/testdata_0101_0614.parquet"
+  # multi-long 输入（二选一）：
+  # long_paths:
+  #   - "/path/to/chunk_0_100.parquet"
+  #   - "/path/to/chunk_100_200.parquet"
+  #   - "/path/to/chunk_200_300.parquet"
+  #   - "/path/to/chunk_300_400.parquet"
+  #   - "/path/to/chunk_400_500.parquet"
+  #   - "/path/to/chunk_500_600.parquet"
+  #   - "/path/to/chunk_600_700.parquet"
+  # long_merge_how: "inner"
+  fields: []
+  label_name: "y"
+  date_start: "2024-01-01"
+  date_end: "2024-06-14"
+
+  feature_mask_csv: "/Users/yulia/Desktop/clickhouse/field_mask.csv"
+  feature_col_name: "feature"
+  feature_use_col: "use"
+
+  build_label: true
+  label_price_col: "open_1d"
+  label_log_return: false
+
+  # 可选：label 后处理（默认关闭）
+  label_postprocess:
+    enabled: false
+    keep_y_raw: false
+    zscore_by_date: { enabled: true, ddof: 0, eps: 1.0e-12 }
+    winsorize_by_date: { enabled: true, lower_q: 0.05, upper_q: 0.95 }
+
+# 可选：feature engineering（默认关闭）
+feature_engineering:
+  enabled: false
+  rolling_stats:
+    enabled: true
+    windows: [5, 10, 20]
+    stats: ["mean", "std"]
+    min_periods: 1
+
+preprocess:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+
+  col_drop_threshold: 0.20
+  row_drop_threshold: 0.20
+
+  nan_policy: "tree_friendly"
+  do_fill_for_tree: false
+  fill_method: "ffill_then_zero"
+  ffill_limit: 5
+
+  add_missing_mask: false
+
+  winsorize:
+    enabled: true
+    by: "date"
+    lower_q: 0.01
+    upper_q: 0.99
+
+  zscore:
+    enabled: false
+    by: "date"
+    method: "standard"   # standard | robust
+    ddof: 0
+    clip: null
+    robust:
+      eps: 1.0e-12
+      use_06745: false
+
+  save_parquet: true
+  save_path: "{preprocess_dir}/preprocessed_{mode}_{label}_{date_start}_{date_end}.parquet"
+  save_state_json: true
+  state_path: "{model_dir}/preprocess_state_fit_{label}_{date_start}_{date_end}.json"
+
+datacutting:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+  weight_col: null
+  feature_cols: null
+  return_dataframe_X: true
+
+  cache:
+    enabled: false
+    mode: "parquet_long"
+    dir: "{run_dir}/cut"
+    file_tpl: "{model}_{part}_fold{fold}.parquet"
+    meta_tpl: "{model}_{part}_fold{fold}_meta.json"
+    npz_tpl: "{model}_{part}_fold{fold}.npz"
+    keys_tpl: "{model}_{part}_fold{fold}_keys.parquet"
+
+  # seq fields (unused if model.family=tree)
+  seq_len: 60
+  incomplete_policy: "drop"
+  pad_side: "left"
+  min_len_to_keep: 1
+  return_mask: true
+  mask_dtype: "bool"
+  strict_check_nan: false
+
+model:
+  family: "tree"
+  name: "lgbm"
+  candidates:
+    lgbm:
+      verbosity: -1
+      objective: "regression"
+      n_estimators: 800
+      learning_rate: 0.05
+      num_leaves: 63
+      max_depth: -1
+      min_data_in_leaf: 200
+      feature_fraction: 0.8
+      bagging_fraction: 0.8
+      bagging_freq: 1
+      lambda_l1: 0.0
+      lambda_l2: 1.0
+      min_gain_to_split: 0.0
+      random_state: 42
+      n_jobs: -1
+
+trainer:
+  name: "rankic_refit_roll"
+  params:
+    metric: "rankic"
+    maximize: true
+    device: "cpu"
+
+    # 每轮窗口定义（支持 days / ratio 两种写法）
+    windowing:
+      mode: "days"
+      initial_train_days: 252
+      eval_test_days: 20
+      prediction_horizon_days: 5
+      step_days: null            # null => step = horizon（future block 不重叠）
+      expanding_train: true
+      max_train_days: null
+
+    # 动态选因子（可选，默认关闭）
+    factor_selection:
+      enabled: false
+      preplan_union_to_dataloader: true  # 阶段2：先算窗口并集并回填到 dataloader.fields，降低 preprocess 宽度
+      predictions_pkl_path: "/Users/yulia/Desktop/clickhouse/predictions.pkl"
+      rankic_threshold: 0.03
+      aggregate: "abs_mean"      # abs_mean | mean_abs
+      cutoff_inclusive: true     # 允许使用 <= train_end 的 RankIC（你已确认）
+      min_history_days: 1
+      empty_selection_policy: "fallback_base_pool"  # fallback_base_pool | skip_window
+
+    # 保存 test/future 的 preds 供 evaluator 使用（建议开启）
+    saver:
+      enabled: true
+      params:
+        dir: "{pred_dir}"
+        save_parts: ["test", "future"]
+        file_tpl: "window{fold:04d}_{part}.parquet"
+
+evaluate:
+  params:
+    task: "regression"
+    pred_dir: "{pred_dir}"
+    out_dir: "{eval_dir}"
+    parts: ["test", "future"]
+    date_col: "date"
+    stockid_col: "stockid"
+
+    # future prediction concat backtest（与 test evaluation 分离输出）
+    future_concat:
+      enabled: true
+      future_part: "future"
+      out_subdir: "future"
+      preds_filename: "future_preds_all.parquet"
+      validate_no_overlap: true
+      save_fig: true

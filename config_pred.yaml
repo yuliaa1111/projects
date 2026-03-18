@@ -1,0 +1,114 @@
+task:
+  mode: "predict"
+  type: "regression"
+  label_col: "y"
+  seed: 42
+
+logging:
+  level: INFO   # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  log_dir: "{runs_root}/{run_id}/logs/predict"  
+  filename: "predict.log"
+  max_bytes: 5242880      
+  backup_count: 100
+  fmt: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  datefmt: "%Y-%m-%d %H:%M:%S"
+  console: true
+
+paths:
+  runs_root: "/Users/yulia/Desktop/clickhouse/runs"
+  run_id: "exp003"                 #<-- 实验编号要和train一致
+
+dataloader:
+  source: "parquet_dir"
+  date_col: "date"
+  stockid_col: "stockid"
+  long_filename: "/Users/yulia/Desktop/clickhouse/testdata_20240617.parquet"
+  # multi-long 输入（二选一）：
+  # long_paths:
+  #   - "/path/to/chunk_0_100.parquet"
+  #   - "/path/to/chunk_100_200.parquet"
+  #   - "/path/to/chunk_200_300.parquet"
+  #   - "/path/to/chunk_300_400.parquet"
+  #   - "/path/to/chunk_400_500.parquet"
+  #   - "/path/to/chunk_500_600.parquet"
+  #   - "/path/to/chunk_600_700.parquet"
+  # long_merge_how: "inner"
+  fields: []
+  label_name: "y"
+  date_start: "2024-06-17"
+  date_end:   "2024-06-17"
+
+  feature_mask_csv: "/Users/yulia/Desktop/clickhouse/field_mask.csv"
+  feature_col_name: "feature"
+  feature_use_col: "use"
+
+  build_label: false   # predict: 不需要 y
+  label_price_col: "open_1d"
+  label_log_return: false
+
+  # ===== Label 后处理（新增，默认关闭）=====
+  # 预测阶段通常没有 y，因此该模块一般无意义；保留字段用于保持 schema 一致
+  label_postprocess:
+    enabled: false
+    keep_y_raw: false
+    zscore_by_date:
+      enabled: true
+      ddof: 0
+      eps: 1.0e-12
+    winsorize_by_date:
+      enabled: true
+      lower_q: 0.05
+      upper_q: 0.95
+
+
+# ===== Feature Engineering（新增模块，默认关闭）=====
+# 注意：若训练启用了 rolling 特征，推理侧也必须能用历史窗口生成同样的 rolling 列
+feature_engineering:
+  enabled: false
+  rolling_stats:
+    enabled: true
+    windows: [5, 10, 20]
+    stats: ["mean", "std"]
+    min_periods: 1
+
+preprocess:
+  date_col: "date"
+  stockid_col: "stockid"
+  label_col: "y"
+
+  col_drop_threshold: 1.01   # 不 drop
+  row_drop_threshold: 1.01
+
+  nan_policy: "tree_friendly"
+  do_fill_for_tree: false
+  fill_method: "ffill_then_zero"
+  ffill_limit: 5
+
+  # 可选：winsorize / zscore（默认关闭，保持旧行为）
+  winsorize:
+    enabled: false
+    by: "date"
+    lower_q: 0.01
+    upper_q: 0.99
+
+  zscore:
+    enabled: false
+    by: "date"
+    method: "standard"  # standard | robust
+    ddof: 0
+    clip: null
+    robust:
+      eps: 1.0e-12
+      use_06745: false
+
+  save_path: "{runs_root}/preprocess/preprocessed_pred_{date_start}_{date_end}.parquet"
+
+model:
+  family: "tree"
+  name: "lgbm"
+
+predict:
+  asof_date: "2024-06-17"
+  target_date: "2024-06-18"
+  bundle_dir: "{model_dir}"
+  out_path: "{pred_infer_dir}/pred_{target_date}.parquet"
