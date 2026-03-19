@@ -5,8 +5,10 @@ Dynamic factor selection based on historical RankIC stored in `predictions.pkl`.
 
 Per docs (ret_pred/md/tasks.md, ret_pred/md/data.md):
 - `predictions.pkl` is a historical record of factor RankIC (NOT model features).
-- At a refit node t, selection must only use information available up to t (<= t here by user confirmation).
 - Output is the selected factor set for this window; within a window it must stay fixed.
+- Selection mode is configurable:
+  - historical_aggregate: use history up to asof_date and aggregate by factor
+  - single_day_threshold: use only one select_date (day snapshot)
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ class RankICSelectionCfg:
     aggregate: str = "abs_mean"  # abs_mean | mean_abs
     cutoff_inclusive: bool = True  # True => use dates <= t; False => < t
     min_history_days: int = 1
+
+
+def _to_day(x: str | pd.Timestamp) -> pd.Timestamp:
+    return pd.Timestamp(pd.to_datetime(x)).normalize()
 
 
 def load_predictions_pkl(path: str | Path) -> Dict[pd.Timestamp, pd.Series]:
@@ -148,6 +154,7 @@ def select_factors_by_rankic(
     inclusive: bool = True,
     min_history_days: int = 1,
     candidate_pool: Optional[Iterable[str]] = None,
+    selection_mode: str = "historical_aggregate",
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Select factors based on historical RankIC up to `asof_date`.
@@ -156,6 +163,17 @@ def select_factors_by_rankic(
       selected_factors (sorted by score desc),
       selection_state (for artifact/logging)
     """
+    selection_mode = str(selection_mode or "historical_aggregate").lower()
+    if selection_mode == "single_day_threshold":
+        return select_factors_by_day_rankic(
+            pred_map_or_df,
+            select_date=asof_date,
+            threshold=threshold,
+            candidate_pool=candidate_pool,
+        )
+    if selection_mode != "historical_aggregate":
+        raise ValueError(f"unknown selection_mode: {selection_mode}")
+
     if isinstance(pred_map_or_df, dict):
         df = to_rankic_frame(pred_map_or_df)
     else:
@@ -181,6 +199,7 @@ def select_factors_by_rankic(
     selected = picked["factor"].astype(str).tolist()
 
     state: Dict[str, Any] = {
+        "selection_mode": "historical_aggregate",
         "asof_date": str(pd.to_datetime(asof_date))[:10],
         "inclusive": bool(inclusive),
         "aggregate": str(aggregate),
@@ -188,6 +207,60 @@ def select_factors_by_rankic(
         "min_history_days": int(min_history_days),
         "n_hist_rows": int(len(hist)),
         "n_factors_seen": int(agg_df.shape[0]),
+        "n_selected": int(len(selected)),
+        "selected": list(selected),
+    }
+    return selected, state
+
+
+def select_factors_by_day_rankic(
+    pred_map_or_df: Dict[pd.Timestamp, pd.Series] | pd.DataFrame,
+    *,
+    select_date: str | pd.Timestamp,
+    threshold: float = 0.03,
+    candidate_pool: Optional[Iterable[str]] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Select factors by rankic snapshot of one day:
+      abs(rankic_on_select_date) >= threshold
+    """
+    if isinstance(pred_map_or_df, dict):
+        df = to_rankic_frame(pred_map_or_df)
+    else:
+        df = pred_map_or_df.copy()
+
+    if df.empty:
+        return [], {"selection_mode": "single_day_threshold", "select_date": str(select_date), "n_day_rows": 0, "selected": []}
+
+    d = _to_day(select_date)
+    date_day = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
+    day = df[date_day == d].copy()
+
+    if candidate_pool is not None:
+        pool = set(str(x) for x in candidate_pool)
+        day = day[day["factor"].astype(str).isin(pool)].copy()
+
+    day = day.dropna(subset=["rankic"]).copy()
+    if day.empty:
+        return [], {
+            "selection_mode": "single_day_threshold",
+            "select_date": str(d.date()),
+            "threshold": float(threshold),
+            "n_day_rows": 0,
+            "n_selected": 0,
+            "selected": [],
+        }
+
+    day["abs_rankic"] = day["rankic"].abs()
+    picked = day[day["abs_rankic"] >= float(threshold)].copy()
+    picked = picked.sort_values("abs_rankic", ascending=False)
+
+    selected = picked["factor"].astype(str).drop_duplicates().tolist()
+    state: Dict[str, Any] = {
+        "selection_mode": "single_day_threshold",
+        "select_date": str(d.date()),
+        "threshold": float(threshold),
+        "n_day_rows": int(len(day)),
         "n_selected": int(len(selected)),
         "selected": list(selected),
     }
@@ -203,6 +276,7 @@ def select_union_factors_by_rankic(
     inclusive: bool = True,
     min_history_days: int = 1,
     candidate_pool: Optional[Iterable[str]] = None,
+    selection_mode: str = "historical_aggregate",
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Build a union factor pool across multiple refit asof dates.
@@ -229,6 +303,7 @@ def select_union_factors_by_rankic(
             inclusive=inclusive,
             min_history_days=min_history_days,
             candidate_pool=pool_list,
+            selection_mode=selection_mode,
         )
         for f in selected:
             if f not in seen:
@@ -237,6 +312,7 @@ def select_union_factors_by_rankic(
         by_asof.append({"asof_date": str(pd.Timestamp(dt).date()), "n_selected": int(len(selected))})
 
     state: Dict[str, Any] = {
+        "selection_mode": str(selection_mode),
         "n_asof_dates": int(len(dates)),
         "asof_start": str(pd.Timestamp(dates[0]).date()),
         "asof_end": str(pd.Timestamp(dates[-1]).date()),

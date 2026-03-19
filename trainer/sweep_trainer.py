@@ -118,6 +118,7 @@ class SweepRollingTrainer:
         nn_fit: Optional[Dict[str, Any]] = None,
         saver: Optional[Dict[str, Any]] = None,
         model_save: Optional[Dict[str, Any]] = None,
+        sample_weighting: Optional[Dict[str, Any]] = None,
         run_id: str = "exp001",
         date_col: str = "date",
         stockid_col: str = "stockid",
@@ -146,6 +147,7 @@ class SweepRollingTrainer:
         self.nn_fit = copy.deepcopy(nn_fit) if isinstance(nn_fit, dict) else nn_fit
         self.saver = copy.deepcopy(saver) if isinstance(saver, dict) else saver
         self.model_save = copy.deepcopy(model_save) if isinstance(model_save, dict) else model_save
+        self.sample_weighting = copy.deepcopy(sample_weighting) if isinstance(sample_weighting, dict) else sample_weighting
 
         self.base_run_id = str(run_id)
         self.date_col = date_col
@@ -262,6 +264,7 @@ class SweepRollingTrainer:
                 update_gate=None,
                 saver=saver_cfg,
                 model_save=model_save_cfg,
+                sample_weighting=self.sample_weighting,
                 run_id=run_id,
                 date_col=self.date_col,
                 stockid_col=self.stockid_col,

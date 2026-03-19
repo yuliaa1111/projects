@@ -84,12 +84,56 @@
 当前常见用法是：
 - 基于 `open_1d` 构造未来一期收益
 - 概念上通常对应 next-day open-to-open return
-- y label约束：每日的raw y为ret(t+1),即[open(t+2)/open(t+1)]-1,不能用次日open/当日open，这样得到的其实是当日ret，必须用次次日open/此日open，这样得到的才是次日ret
+- y label约束：每日的raw y为ret(t+1),即[open(t+2)/open(t+1)]-1,不能用次日open/当日open，这样得到的其实是当日ret，必须用次次日open/此日open，这样得到的才是次日ret。具体构造方式如下，不允许擅自啊改变。
+
+    """
+    在 long-format 数据上构造“下一期收益率”label：
+      y_t = P_{t+2}/P_{t+1} - 1
+
+    - 对每只股票按日期排序，然后 groupby(stockid) 得到：
+      p_t1 = shift(-1), p_t2 = shift(-2)
+    - 支持简单收益 / 对数收益
+
+    注意：
+    - 本函数不会删除最后一天的样本；最后一天会得到 NaN label（由后续 preprocess 决定如何处理）
+    - label_method（open_to_open 等）在本模块中仅作为 meta 记录
+
+    Args:
+        df_long: 输入 long DataFrame，至少包含 [date_col, stockid_col, price_col]
+        date_col: 日期列名
+        stockid_col: 股票 ID 列名
+        price_col: 价格列名（例如 open_1d）
+        label_name: 生成的 label 列名
+        log_return: True 生成 log return；False 生成 simple return
+
+    Returns:
+        pd.DataFrame: 返回包含新增 label 列的 DataFrame（copy）
+
+    Raises:
+        ValueError: price_col 不存在
+    """
+    if price_col not in df_long.columns:
+        raise ValueError(f"price_col '{price_col}' not found in long df")
+
+    out = df_long.copy()
+
+    # 确保 shift 的“下一期”是按时间递增对齐
+    out = out.sort_values([stockid_col, date_col])
+
+    g = out.groupby(stockid_col, sort=False)[price_col]
+    p_t1 = g.shift(-1)
+    p_t2 = g.shift(-2)
+    if log_return:
+        out[label_name] = np.log(p_t2) - np.log(p_t1)
+    else:
+        out[label_name] = p_t2 / p_t1 - 1.0
+
+    return out
 ---
 
 ## 5. Feature 筛选逻辑
 
-框架支持通过 `feature_mask_csv` 进行特征筛选。
+框架支持通过 `feature_mask_csv` 进行特征筛选，同时需要支持`feature_mask_csv`为null时也能运行。
 
 ### 5.1 为什么存在这个机制
 其目的包括：
@@ -115,10 +159,17 @@
 ### 5.3 重要行为
 feature mask 的逻辑在训练和预测阶段都要共用。
 这是保证特征对齐的关键。
-
+需要支持`feature_mask_csv`为null时也能运行
 ---
 
 ## 6. Label 语义
+框架需要支持切换不同的y label，一共支持这几种 y：
+y_raw：原始未来收益标签。
+y continuous without rank：连续收益标签。
+y continuous with rank：按日横截面 rank 后的连续标签。
+y normalized continuous：归一化后的连续标签。
+y extreme without rank：直接按连续值做 top/bottom extreme 标签。
+y extreme with rank：先 rank 再做 top/bottom extreme 标签。
 
 ### 6.1 连续型 label
 默认形式：
@@ -306,6 +357,21 @@ predictions.pkl 的本质含义可以理解成：
 - 在每个新的重训节点，只能使用截至该节点及以前的历史信息
 - 不能读取未来日期的因子表现
 - 可按给定阈值筛选有效因子，例如 RankIC绝对值 >= 0.03
+  目标语义
+  1. 每个窗口取一个锚点日期（“窗口第一天”）。
+  2. 只看 predictions.pkl 在这个日期当天的 rankic。
+  3. 当天满足 abs(rankic) >= 0.03 的因子入选该窗口。
+  4. dataloader 预读因子池 = 所有窗口入选因子的并集。
+
+trainer 接法应该是这样的：
+对于每个 rolling window：
+先拿到这个窗口第一天 window_start_date
+调 select_factors_by_day_rankic(pred_map, select_date=window_start_date, threshold=0.03, candidate_pool=当前可用字段)
+得到该窗口固定因子集 selected_factors
+用这批因子跑该窗口 train和test，然后再把模型在train+test的全量数据上fit一遍得到final mode
+用final model预测future，在future的第一天，读取当日predictions.pkl中符合要求的因子集，用新因子集预测
+所以每个window要在“train的第一天”和“future的第一天”重选因子，涉及的因子都要进入select_factors_by_day_rankic
+下一窗口再重复此步骤
 
 ### 11.2 输出含义
 在某个重训节点得到的筛选结果，是**这一轮固定使用的因子集合**。
@@ -409,6 +475,29 @@ future prediction 的作用是：
 ## 14A. 已有因子评测系统接入语义（新增）
 
 框架需要支持将 prediction 输出进一步送入已有的因子评测系统。
+
+complete_factor_analysis(
+    factor_name='factor_name',  # 自定义因子名称
+    input_factor_df=df,  # 如果已存在因子DataFrame，可直接传入
+    start_date=datetime(2023, 1, 1, 0, 0, 0),
+    end_date=datetime(2024, 12, 31, 0, 0, 0),
+    frequency=1,  # 数据频率，默认日频 '1d'
+    factor_direction='positive', # 'positive' or 'negative'
+    portfolio_type='long_only',
+    long_groups=[9, 10],
+    short_groups=[1, 2],
+    group_num=10,
+    neutralize=False,  # 是否进行中性化处理
+    save_figures=False, # 是否保存图表
+    save_dir=None,  # 保存结果的目录
+    return_data=False,
+    verbose=True,
+    client=client,  # 使用之前创建的数据库连接对象
+    excess_return=False, # 是否使用超额收益率进行分析
+    eval_price='open', # close to close or open to open
+    enable_turnover_fee=True, # 是否启用费率模式
+    turnover_fee_rate=0.00045
+)
 
 ### 对新训练策略 `rankic_refit_roll`
 进入因子评测系统的输入必须是：

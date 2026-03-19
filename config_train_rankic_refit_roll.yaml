@@ -55,6 +55,12 @@ dataloader:
   label_postprocess:
     enabled: false
     keep_y_raw: false
+    rank_by_date:
+      enabled: false
+      pct: true
+      centered: false
+      ties_method: "average"
+      na_option: "keep"
     zscore_by_date: { enabled: true, ddof: 0, eps: 1.0e-12 }
     winsorize_by_date: { enabled: true, lower_q: 0.05, upper_q: 0.95 }
 
@@ -171,12 +177,35 @@ trainer:
     factor_selection:
       enabled: false
       preplan_union_to_dataloader: true  # 阶段2：先算窗口并集并回填到 dataloader.fields，降低 preprocess 宽度
+      selection_mode: "single_day_threshold"  # single_day_threshold | historical_aggregate
+      train_test_anchor: "train_start"        # train_start | train_end | test_start | test_end | future_start | future_end
+      future_anchor: "future_start"           # future 重选因子锚点
+      future_reselect: true                   # true: future 使用重选因子；false: 继承 train/test 因子
       predictions_pkl_path: "/Users/yulia/Desktop/clickhouse/predictions.pkl"
       rankic_threshold: 0.03
       aggregate: "abs_mean"      # abs_mean | mean_abs
       cutoff_inclusive: true     # 允许使用 <= train_end 的 RankIC（你已确认）
       min_history_days: 1
       empty_selection_policy: "fallback_base_pool"  # fallback_base_pool | skip_window
+
+    sample_weighting:
+      enabled: false
+      recency:
+        enabled: false
+        mode: "exp"          # exp | linear
+        half_life_days: 63
+        min_weight: 0.2
+        max_weight: 1.0
+      tail_y:
+        enabled: false
+        scope: "global"      # global | date
+        side: "both"         # both | upper | lower
+        lower_q: 0.1
+        upper_q: 0.9
+        tail_weight: 2.0
+        mid_weight: 1.0
+      combine: "multiply"    # multiply | add | max
+      normalize: "mean1"     # mean1 | none
 
     # 保存 test/future 的 preds 供 evaluator 使用（建议开启）
     saver:

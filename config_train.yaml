@@ -55,10 +55,16 @@ dataloader:
 
   # ===== Label 后处理（新增，默认关闭）=====
   # 语义：raw y 构造完成后，对 y 按交易日做截面变换（不触碰价格列）
-  # 默认顺序固定：zscore_by_date -> winsorize_by_date
+  # 默认顺序固定：rank_by_date -> zscore_by_date -> winsorize_by_date
   label_postprocess:
     enabled: false
     keep_y_raw: false           # true 时保留一列 y_raw（注意：必须避免把 y_raw 当作特征）
+    rank_by_date:
+      enabled: false
+      pct: true
+      centered: false
+      ties_method: "average"
+      na_option: "keep"
 
     zscore_by_date:
       enabled: true
@@ -223,6 +229,25 @@ trainer:
       name: "mse"        # mse | mae | huber | quantile ...
       # params:
         # alpha: 0.9       #  huber | quantile
+
+    sample_weighting:
+      enabled: false
+      recency:
+        enabled: false
+        mode: "exp"      # exp | linear
+        half_life_days: 63
+        min_weight: 0.2
+        max_weight: 1.0
+      tail_y:
+        enabled: false
+        scope: "global"  # global | date
+        side: "both"     # both | upper | lower
+        lower_q: 0.1
+        upper_q: 0.9
+        tail_weight: 2.0
+        mid_weight: 1.0
+      combine: "multiply"  # multiply | add | max
+      normalize: "mean1"   # mean1 | none
 
     # nn_fit:
     #   epochs: 5

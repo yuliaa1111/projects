@@ -13,7 +13,7 @@
 #
 # 新增功能：
 # 1) feature_mask_csv：按每周末 0/1 因子表筛选字段（训练 & 推理共用）
-# 2) build_label：用价格列构造 next-day return 作为 label（open-to-open 等）
+# 2) build_label：用价格列构造 next-day return 作为 label（ret(t+1)）
 # 3) load_cross_section：按单日拉横截面（predict 用）
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class DLCfg:
 
         build_label (bool): 是否基于价格列构造 forward return label
         label_price_col (str): 构造 label 使用的价格列名（例如 open_1d / close_1d）
-        label_method (str): label 方式标识（目前用于记录 meta；真正计算由 shift(-1) 实现）
+        label_method (str): label 方式标识（目前用于记录 meta；默认 raw label 为 ret(t+1)）
         label_log_return (bool): True=对数收益；False=简单收益
     """
     source: str = "parquet_dir"
@@ -138,7 +138,7 @@ def apply_label_postprocess(
     Required semantics (per docs):
     - applied AFTER raw label construction
     - does NOT touch any price columns
-    - default order fixed: zscore_by_date -> winsorize_by_date
+    - default order fixed: rank_by_date -> zscore_by_date -> winsorize_by_date
 
     Args:
         df_long: long DataFrame
@@ -165,7 +165,32 @@ def apply_label_postprocess(
     if keep_y_raw and f"{label_col}_raw" not in out.columns:
         out[f"{label_col}_raw"] = out[label_col]
 
-    # ---- step 1) zscore by date (enabled by default within an enabled chain) ----
+    # ---- step 1) rank by date (optional) ----
+    r_cfg = (cfg.get("rank_by_date", {}) or {})
+    if bool(r_cfg.get("enabled", False)):
+        ties_method = str(r_cfg.get("ties_method", "average"))
+        if ties_method not in {"average", "min", "max", "first", "dense"}:
+            raise ValueError(f"label_postprocess rank_by_date.ties_method invalid: {ties_method}")
+
+        na_option = str(r_cfg.get("na_option", "keep"))
+        if na_option not in {"keep", "top", "bottom"}:
+            raise ValueError(f"label_postprocess rank_by_date.na_option invalid: {na_option}")
+
+        pct = bool(r_cfg.get("pct", True))
+        centered = bool(r_cfg.get("centered", False))
+
+        g = out.groupby(date_col, sort=False)[label_col]
+        ranked = g.rank(method=ties_method, na_option=na_option, pct=pct)
+        if centered:
+            if pct:
+                ranked = ranked - 0.5
+            else:
+                n = g.transform("count")
+                ranked = ranked - (n + 1.0) / 2.0
+
+        out[label_col] = ranked.where(out[label_col].notna(), np.nan)
+
+    # ---- step 2) zscore by date (enabled by default within an enabled chain) ----
     z_cfg = (cfg.get("zscore_by_date", {}) or {})
     if bool(z_cfg.get("enabled", True)):
         ddof = int(z_cfg.get("ddof", 0))
@@ -182,7 +207,35 @@ def apply_label_postprocess(
         z = z.where(out[label_col].notna(), np.nan)
         out[label_col] = z
 
-    # ---- step 2) winsorize by date (enabled by default within an enabled chain) ----
+        # optional hard clip right after zscore, before winsorize
+        # supported forms:
+        #   clip: 5           -> [-5, 5]
+        #   clip: [-5, 5]     -> [lo, hi]
+        clip_cfg = z_cfg.get("clip", None)
+        if clip_cfg is not None:
+            lo: Optional[float] = None
+            hi: Optional[float] = None
+            if isinstance(clip_cfg, (int, float)):
+                c = float(clip_cfg)
+                if c < 0:
+                    raise ValueError(f"label_postprocess zscore_by_date.clip must be >= 0, got: {c}")
+                lo, hi = -c, c
+            elif isinstance(clip_cfg, (list, tuple)) and len(clip_cfg) == 2:
+                lo, hi = float(clip_cfg[0]), float(clip_cfg[1])
+            else:
+                raise ValueError(
+                    "label_postprocess zscore_by_date.clip must be number or [lower, upper], "
+                    f"got: {clip_cfg}"
+                )
+
+            if lo is None or hi is None or lo >= hi:
+                raise ValueError(
+                    "label_postprocess zscore_by_date.clip invalid; require lower < upper, "
+                    f"got: {clip_cfg}"
+                )
+            out[label_col] = out[label_col].clip(lower=lo, upper=hi)
+
+    # ---- step 3) winsorize by date (enabled by default within an enabled chain) ----
     w_cfg = (cfg.get("winsorize_by_date", {}) or {})
     if bool(w_cfg.get("enabled", True)):
         lower_q = float(w_cfg.get("lower_q", 0.05))
@@ -316,14 +369,16 @@ def build_forward_return_label_long(
     log_return: bool = False,
 ) -> pd.DataFrame:
     """
-    在 long-format 数据上构造“下一期收益率”label：y_t = P_{t+1}/P_t - 1。
+    在 long-format 数据上构造“下一期收益率”label：
+      y_t = P_{t+2}/P_{t+1} - 1
 
-    - 对每只股票按日期排序，然后 groupby(stockid).shift(-1) 得到 next_price
+    - 对每只股票按日期排序，然后 groupby(stockid) 得到：
+      p_t1 = shift(-1), p_t2 = shift(-2)
     - 支持简单收益 / 对数收益
 
     注意：
     - 本函数不会删除最后一天的样本；最后一天会得到 NaN label（由后续 preprocess 决定如何处理）
-    - label_method（open_to_open 等）在本模块中仅作为 meta 记录；真正计算均为 shift(-1)
+    - label_method（open_to_open 等）在本模块中仅作为 meta 记录
 
     Args:
         df_long: 输入 long DataFrame，至少包含 [date_col, stockid_col, price_col]
@@ -347,11 +402,13 @@ def build_forward_return_label_long(
     # 确保 shift 的“下一期”是按时间递增对齐
     out = out.sort_values([stockid_col, date_col])
 
-    next_price = out.groupby(stockid_col, sort=False)[price_col].shift(-1)
+    g = out.groupby(stockid_col, sort=False)[price_col]
+    p_t1 = g.shift(-1)
+    p_t2 = g.shift(-2)
     if log_return:
-        out[label_name] = np.log(next_price) - np.log(out[price_col])
+        out[label_name] = np.log(p_t2) - np.log(p_t1)
     else:
-        out[label_name] = next_price / out[price_col] - 1.0
+        out[label_name] = p_t2 / p_t1 - 1.0
 
     return out
 
@@ -772,7 +829,7 @@ def load_long(req: DLRequest, cfg: DLCfg, *, client=None) -> Tuple[pd.DataFrame,
                 label_name=req.label_name,
                 log_return=cfg.label_log_return,
             )
-            meta["label_src"] = f"computed_{cfg.label_method}_shift(-1)"
+            meta["label_src"] = f"computed_{cfg.label_method}_shift(-2,-1)"
             meta["price_col_for_label"] = cfg.label_price_col
         else:
             meta["label_src"] = cfg.label_src
@@ -885,7 +942,7 @@ def load_long(req: DLRequest, cfg: DLCfg, *, client=None) -> Tuple[pd.DataFrame,
                 label_name=req.label_name,
                 log_return=cfg.label_log_return,
             )
-            meta["label_src"] = f"computed_{cfg.label_method}_shift(-1)"
+            meta["label_src"] = f"computed_{cfg.label_method}_shift(-2,-1)"
             meta["price_col_for_label"] = cfg.label_price_col
         else:
             # label 不需要计算：记录 meta 方便复盘
@@ -991,7 +1048,7 @@ def load_long(req: DLRequest, cfg: DLCfg, *, client=None) -> Tuple[pd.DataFrame,
             label_name=req.label_name,
             log_return=cfg.label_log_return,
         )
-        meta["label_src"] = f"computed_{cfg.label_method}_shift(-1)"
+        meta["label_src"] = f"computed_{cfg.label_method}_shift(-2,-1)"
         meta["price_col_for_label"] = cfg.label_price_col
 
     # label postprocess（optional; after raw label is available）

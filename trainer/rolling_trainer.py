@@ -29,6 +29,7 @@ from .plugins import (
 
 from .model_select import build_model_selector
 from .model_bundle import save_model_bundle
+from .sample_weighting import build_sample_weights
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ class RollingTrainer:
         update_gate: Optional[Dict[str, Any]] = None,
         saver: Optional[Dict[str, Any]] = None,
         model_save: Optional[Dict[str, Any]] = None,
+        sample_weighting: Optional[Dict[str, Any]] = None,
         run_id: str = "exp001",
         date_col: str = "date",
         stockid_col: str = "stockid",
@@ -150,6 +152,7 @@ class RollingTrainer:
         self.model_save_cfg = model_save or {"enabled": False}
         self.model_save_enabled = bool(self.model_save_cfg.get("enabled", False))
         self.model_selector = build_model_selector(self.model_save_cfg if self.model_save_enabled else None)
+        self.sample_weighting_cfg = dict(sample_weighting or {})
 
         self.run_id = run_id
         self.date_col = date_col
@@ -176,7 +179,7 @@ class RollingTrainer:
 
         logger.info(
             "RollingTrainer init | run_id=%s | model=%s | family=%s | metric=%s | maximize=%s | device=%s | seed=%s | "
-            "tuner=%s | saver=%s | model_save=%s",
+            "tuner=%s | saver=%s | model_save=%s | sample_weighting=%s",
             self.run_id,
             str(self.model_cfg.get("name", "")),
             str(self.model_cfg.get("family", "")),
@@ -187,6 +190,7 @@ class RollingTrainer:
             bool(self.tuner_enabled),
             bool(self.save_enabled),
             bool(self.model_save_enabled),
+            bool(self.sample_weighting_cfg.get("enabled", False)),
         )
 
         # =========================================================
@@ -737,21 +741,29 @@ class RollingTrainer:
 
         X_train = train_pl["X"]
         y_train = train_pl["y"]
+        sample_weight, sw_state = build_sample_weights(
+            payload=train_pl,
+            cfg=self.sample_weighting_cfg,
+            date_col=self.date_col,
+        )
 
         has_valid = not self._is_empty_payload(valid_pl)
-        fit_info: Dict[str, Any] = {"used_eval_set": False}
+        fit_info: Dict[str, Any] = {"used_eval_set": False, "sample_weight": sw_state}
+        fit_kwargs: Dict[str, Any] = {}
+        if sample_weight is not None:
+            fit_kwargs["sample_weight"] = sample_weight
 
         if has_valid:
             X_valid = valid_pl["X"]  # type: ignore[index]
             y_valid = valid_pl["y"]  # type: ignore[index]
             try:
-                model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
+                model.fit(X_train, y_train, eval_set=[(X_valid, y_valid)], **fit_kwargs)
                 fit_info["used_eval_set"] = True
             except TypeError:
-                model.fit(X_train, y_train)
+                model.fit(X_train, y_train, **fit_kwargs)
                 fit_info["used_eval_set"] = False
         else:
-            model.fit(X_train, y_train)
+            model.fit(X_train, y_train, **fit_kwargs)
 
         return model, fit_info
 
@@ -788,6 +800,8 @@ class RollingTrainer:
         y = self._to_tensor(train_pl["y"])
 
         n = X.shape[0]
+        if bool((self.sample_weighting_cfg or {}).get("enabled", False)):
+            logger.warning("sample_weighting for nn is not implemented yet; ignored in _fit_nn")
         train_losses = []
         for _ in range(epochs):
             perm = torch.randperm(n, device=X.device)

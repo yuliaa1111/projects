@@ -19,10 +19,11 @@ Key semantics:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, date as dt_date
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import glob
+import inspect
 import json
 import logging
 import os
@@ -362,10 +363,44 @@ def run_factor_eval_from_preds(
         save_dir.mkdir(parents=True, exist_ok=True)
 
         params = dict(analysis_params)
+        # eval_all.complete_factor_analysis expects datetime-like values
+        # for start_date/end_date (it calls `.date()` internally).
+        for k in ("start_date", "end_date"):
+            if k not in params or params[k] is None:
+                continue
+            v = params[k]
+            if isinstance(v, datetime):
+                pass
+            elif isinstance(v, dt_date):
+                params[k] = datetime(v.year, v.month, v.day)
+            else:
+                ts = pd.to_datetime(v, errors="raise")
+                if isinstance(ts, pd.Timestamp):
+                    params[k] = ts.to_pydatetime()
+                else:
+                    raise TypeError(f"factor_eval analysis_params.{k} must be datetime-like, got: {type(v)}")
+
         params["input_factor_df"] = factor_df
         params["client"] = client
         params["save_dir"] = str(save_dir)
         params["excess_return"] = bool(excess_return)
+
+        # Compatibility: different server versions of eval_all.complete_factor_analysis
+        # may expose different kwargs (e.g., turnover-fee args). Keep only supported ones.
+        try:
+            sig = inspect.signature(complete_factor_analysis)
+            has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+            if not has_var_kw:
+                allowed = set(sig.parameters.keys())
+                dropped = sorted([k for k in params.keys() if k not in allowed])
+                if dropped:
+                    logger.warning(
+                        "complete_factor_analysis unsupported kwargs dropped: %s",
+                        dropped,
+                    )
+                    params = {k: v for k, v in params.items() if k in allowed}
+        except Exception:
+            logger.exception("failed to inspect complete_factor_analysis signature; fallback to raw kwargs")
 
         complete_factor_analysis(**params)
         _write_meta(save_dir, excess_return=excess_return)

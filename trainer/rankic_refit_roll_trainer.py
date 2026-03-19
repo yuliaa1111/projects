@@ -5,15 +5,14 @@ Trainer strategy: rankic_refit_roll
 
 Semantics (see ret_pred/md/tasks.md, ret_pred/md/data.md):
 Each round has 4 stages:
-1) factor selection using historical RankIC (predictions.pkl) up to refit node t
+1) select factor set for train/test by configured anchor date
 2) train -> test evaluation (eval model trained on train split, evaluated on test split)
-3) refit final model on train+test (same fixed factor set)
+3) select factor set for future by configured future anchor date, then refit final model on train+test
 4) predict future block (N days) AFTER test end; future blocks are stitched for backtest
 
 Hard constraints:
-- factor set fixed within a round
+- train/test and future may use different factor sets within one round (per user workflow)
 - strict separation between test evaluation and future prediction
-- factor selection uses only information <= t (inclusive here, per user confirmation)
 """
 
 from __future__ import annotations
@@ -129,6 +128,16 @@ def _infer_numeric_cols_from_schema(
         return [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
 
 
+def _resolve_window_anchor_date(w: Any, anchor: Optional[str], *, default: str = "train_start") -> pd.Timestamp:
+    """
+    Resolve a date anchor from WindowDef by field name.
+    """
+    name = str(anchor or default)
+    if not hasattr(w, name):
+        name = default
+    return pd.Timestamp(getattr(w, name))
+
+
 @dataclass
 class RankICRefitRollParams:
     # factor selection
@@ -204,6 +213,7 @@ class RankICRefitRollTrainer:
         # factor selection (optional)
         self.fs_cfg = dict(self.p.factor_selection or {})
         self.fs_enabled = bool(self.fs_cfg.get("enabled", False))
+        self.sample_weighting_cfg = dict(params.get("sample_weighting", {}) or {})
         self._pred_map = None
         if self.fs_enabled:
             pkl_path = str(self.fs_cfg.get("predictions_pkl_path", ""))
@@ -226,6 +236,7 @@ class RankICRefitRollTrainer:
             update_gate=None,
             saver=self.p.saver,
             model_save={"enabled": False},
+            sample_weighting=self.sample_weighting_cfg,
             run_id=self.run_id,
             date_col=self.date_col,
             stockid_col=self.stockid_col,
@@ -242,18 +253,20 @@ class RankICRefitRollTrainer:
             bool(self.fs_enabled),
         )
 
-    def _select_factor_set(self, *, asof_date: pd.Timestamp, candidate_pool: List[str]) -> Tuple[List[str], Dict[str, Any]]:
+    def _select_factor_set(self, *, select_date: pd.Timestamp, candidate_pool: List[str]) -> Tuple[List[str], Dict[str, Any]]:
         if not self.fs_enabled or self._pred_map is None:
-            return list(candidate_pool), {"enabled": False, "asof_date": str(asof_date)[:10], "n_selected": int(len(candidate_pool))}
+            return list(candidate_pool), {"enabled": False, "select_date": str(select_date)[:10], "n_selected": int(len(candidate_pool))}
 
+        selection_mode = str(self.fs_cfg.get("selection_mode", "historical_aggregate"))
         selected, state = select_factors_by_rankic(
             self._pred_map,
-            asof_date=asof_date,
+            asof_date=select_date,
             threshold=float(self.fs_cfg.get("rankic_threshold", self.fs_cfg.get("threshold", 0.03))),
             aggregate=str(self.fs_cfg.get("aggregate", "abs_mean")),
             inclusive=bool(self.fs_cfg.get("cutoff_inclusive", True)),
             min_history_days=int(self.fs_cfg.get("min_history_days", 1)),
             candidate_pool=candidate_pool,
+            selection_mode=selection_mode,
         )
         return selected, {"enabled": True, **state}
 
@@ -302,67 +315,110 @@ class RankICRefitRollTrainer:
         if len(base_pool) == 0:
             raise ValueError("rankic_refit_roll: candidate_pool is empty after preprocess schema filtering")
 
-        logger.info("rankic_refit_roll run start | n_windows=%d | candidate_pool=%d", int(len(windows)), int(len(base_pool)))
+        selection_mode = str(self.fs_cfg.get("selection_mode", "historical_aggregate")).lower()
+        train_test_anchor = str(self.fs_cfg.get("train_test_anchor", "train_start"))
+        future_anchor = str(self.fs_cfg.get("future_anchor", "future_start"))
+        future_reselect = bool(self.fs_cfg.get("future_reselect", selection_mode == "single_day_threshold"))
+
+        logger.info(
+            "rankic_refit_roll run start | n_windows=%d | candidate_pool=%d | selection_mode=%s | train_test_anchor=%s | future_anchor=%s | future_reselect=%s",
+            int(len(windows)),
+            int(len(base_pool)),
+            selection_mode,
+            train_test_anchor,
+            future_anchor,
+            bool(future_reselect),
+        )
 
         for w in windows:
             fold = int(w.window_id)
-            selected_factors, fs_state = self._select_factor_set(asof_date=w.factor_selection_asof_date, candidate_pool=base_pool)
+            rec_base = {
+                "window_id": fold,
+                "train_start": str(w.train_start)[:10],
+                "train_end": str(w.train_end)[:10],
+                "test_start": str(w.test_start)[:10],
+                "test_end": str(w.test_end)[:10],
+                "future_start": str(w.future_start)[:10],
+                "future_end": str(w.future_end)[:10],
+            }
 
-            # If rankic threshold leads to empty set, fallback to base pool by default.
-            if len(selected_factors) == 0:
-                policy = str(self.fs_cfg.get("empty_selection_policy", "fallback_base_pool")).lower()
+            policy = str(self.fs_cfg.get("empty_selection_policy", "fallback_base_pool")).lower()
+
+            def _normalize_selection(raw_selected: List[str], raw_state: Dict[str, Any], *, tag: str) -> Tuple[List[str], Dict[str, Any], Optional[str]]:
+                state = dict(raw_state or {})
+                selected = [str(x) for x in list(raw_selected or [])]
+                selected = [f for f in selected if f in cols_set and f not in required]
+                if len(selected) > 0:
+                    return selected, state, None
                 if policy == "fallback_base_pool":
-                    selected_factors = list(base_pool)
-                    fs_state = dict(fs_state or {})
-                    fs_state["empty_selection_fallback"] = "base_pool"
-                else:
-                    records.append(
-                        {
-                            "window_id": fold,
-                            "train_end": str(w.train_end)[:10],
-                            "test_start": str(w.test_start)[:10],
-                            "test_end": str(w.test_end)[:10],
-                            "future_start": str(w.future_start)[:10],
-                            "future_end": str(w.future_end)[:10],
-                            "n_selected_factors": 0,
-                            "factor_selection": dict(fs_state or {}),
-                            "test_score": np.nan,
-                            "future_score": np.nan,
-                            "saved_test": None,
-                            "saved_future": None,
-                            "skipped": True,
-                            "skip_reason": "empty_selected_factors",
-                        }
-                    )
-                    logger.warning("window skipped | id=%d | reason=empty_selected_factors", fold)
-                    continue
+                    fb = [f for f in base_pool if f in cols_set and f not in required]
+                    if len(fb) == 0:
+                        return [], state, f"{tag}_fallback_base_pool_empty"
+                    state[f"{tag}_empty_selection_fallback"] = "base_pool"
+                    return fb, state, None
+                return [], state, f"{tag}_empty_selected_factors"
 
-            # Selected factors may include cols dropped by preprocess; filter to available cols.
-            selected_factors = [f for f in selected_factors if f in cols_set and f not in required]
-            if len(selected_factors) == 0:
+            train_select_date = _resolve_window_anchor_date(w, train_test_anchor, default="train_start")
+            train_selected_raw, fs_train_state = self._select_factor_set(select_date=train_select_date, candidate_pool=base_pool)
+            train_factors, fs_train_state, skip_reason = _normalize_selection(train_selected_raw, fs_train_state, tag="train_test")
+            if skip_reason is not None:
                 records.append(
                     {
-                        "window_id": fold,
-                        "train_end": str(w.train_end)[:10],
-                        "test_start": str(w.test_start)[:10],
-                        "test_end": str(w.test_end)[:10],
-                        "future_start": str(w.future_start)[:10],
-                        "future_end": str(w.future_end)[:10],
+                        **rec_base,
                         "n_selected_factors": 0,
-                        "factor_selection": dict(fs_state or {}),
+                        "n_selected_factors_train_test": 0,
+                        "n_selected_factors_future": 0,
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": None,
                         "test_score": np.nan,
                         "future_score": np.nan,
+                        "saved_train": None,
                         "saved_test": None,
                         "saved_future": None,
                         "skipped": True,
-                        "skip_reason": "selected_factors_not_in_preprocess",
+                        "skip_reason": skip_reason,
                     }
                 )
-                logger.warning("window skipped | id=%d | reason=selected_factors_not_in_preprocess", fold)
+                logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
+                continue
+
+            future_select_date = _resolve_window_anchor_date(w, future_anchor, default="future_start")
+            if future_reselect:
+                future_selected_raw, fs_future_state = self._select_factor_set(select_date=future_select_date, candidate_pool=base_pool)
+            else:
+                future_selected_raw = list(train_factors)
+                fs_future_state = {
+                    "enabled": bool(self.fs_enabled),
+                    "selection_mode": "inherit_train_test",
+                    "select_date": str(future_select_date)[:10],
+                    "n_selected": int(len(future_selected_raw)),
+                }
+            future_factors, fs_future_state, skip_reason = _normalize_selection(future_selected_raw, fs_future_state, tag="future")
+            if skip_reason is not None:
+                records.append(
+                    {
+                        **rec_base,
+                        "n_selected_factors": int(len(train_factors)),
+                        "n_selected_factors_train_test": int(len(train_factors)),
+                        "n_selected_factors_future": 0,
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": dict(fs_future_state or {}),
+                        "test_score": np.nan,
+                        "future_score": np.nan,
+                        "saved_train": None,
+                        "saved_test": None,
+                        "saved_future": None,
+                        "skipped": True,
+                        "skip_reason": skip_reason,
+                    }
+                )
+                logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
                 continue
 
             # read only needed columns (reduce IO)
-            cols = [self.date_col, self.stockid_col, self.label_col] + list(selected_factors)
+            cols = [self.date_col, self.stockid_col, self.label_col] + list(train_factors) + list(future_factors)
             cols = list(dict.fromkeys(cols))
 
             # train (<= train_end), test (test_start..test_end), refit (<= test_end), future (future_start..future_end)
@@ -391,16 +447,16 @@ class RankICRefitRollTrainer:
             if df_train.empty or df_test.empty or df_future.empty:
                 records.append(
                     {
-                        "window_id": fold,
-                        "train_end": str(w.train_end)[:10],
-                        "test_start": str(w.test_start)[:10],
-                        "test_end": str(w.test_end)[:10],
-                        "future_start": str(w.future_start)[:10],
-                        "future_end": str(w.future_end)[:10],
-                        "n_selected_factors": int(len(selected_factors)),
-                        "factor_selection": dict(fs_state or {}),
+                        **rec_base,
+                        "n_selected_factors": int(len(train_factors)),
+                        "n_selected_factors_train_test": int(len(train_factors)),
+                        "n_selected_factors_future": int(len(future_factors)),
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": dict(fs_future_state or {}),
                         "test_score": np.nan,
                         "future_score": np.nan,
+                        "saved_train": None,
                         "saved_test": None,
                         "saved_future": None,
                         "skipped": True,
@@ -416,28 +472,32 @@ class RankICRefitRollTrainer:
                 )
                 continue
 
-            # Cut to payloads (factor set fixed for this round)
-            train_pl = self._cut_part(df_train, feature_cols=selected_factors, fold=fold, part="train")
-            test_pl = self._cut_part(df_test, feature_cols=selected_factors, fold=fold, part="test")
-            future_pl = self._cut_part(df_future, feature_cols=selected_factors, fold=fold, part="future")
+            # train/test use train_factors; future can use future_factors (re-selected at future anchor).
+            train_pl = self._cut_part(df_train, feature_cols=train_factors, fold=fold, part="train")
+            test_pl = self._cut_part(df_test, feature_cols=train_factors, fold=fold, part="test")
+            refit_train_pl = self._cut_part(df_train, feature_cols=future_factors, fold=fold, part="train_refit")
+            refit_test_pl = self._cut_part(df_test, feature_cols=future_factors, fold=fold, part="test_refit")
+            future_pl = self._cut_part(df_future, feature_cols=future_factors, fold=fold, part="future")
 
             if (
                 self._helper._is_empty_payload(train_pl)
                 or self._helper._is_empty_payload(test_pl)
+                or self._helper._is_empty_payload(refit_train_pl)
+                or self._helper._is_empty_payload(refit_test_pl)
                 or self._helper._is_empty_payload(future_pl)
             ):
                 records.append(
                     {
-                        "window_id": fold,
-                        "train_end": str(w.train_end)[:10],
-                        "test_start": str(w.test_start)[:10],
-                        "test_end": str(w.test_end)[:10],
-                        "future_start": str(w.future_start)[:10],
-                        "future_end": str(w.future_end)[:10],
-                        "n_selected_factors": int(len(selected_factors)),
-                        "factor_selection": dict(fs_state or {}),
+                        **rec_base,
+                        "n_selected_factors": int(len(train_factors)),
+                        "n_selected_factors_train_test": int(len(train_factors)),
+                        "n_selected_factors_future": int(len(future_factors)),
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": dict(fs_future_state or {}),
                         "test_score": np.nan,
                         "future_score": np.nan,
+                        "saved_train": None,
                         "saved_test": None,
                         "saved_future": None,
                         "skipped": True,
@@ -451,6 +511,10 @@ class RankICRefitRollTrainer:
                 "run_id": self.run_id,
                 "fold": fold,
                 "step_id": fold,
+                "train_factor_select_date": str(train_select_date)[:10],
+                "future_factor_select_date": str(future_select_date)[:10],
+                "n_features_train_test": int(len(train_factors)),
+                "n_features_future": int(len(future_factors)),
                 "train_end": str(w.train_end)[:10],
                 "test_start": str(w.test_start)[:10],
                 "test_end": str(w.test_end)[:10],
@@ -460,15 +524,26 @@ class RankICRefitRollTrainer:
 
             # ---- 2) eval model: train -> test evaluation ----
             eval_model, _ = self._helper._fit_one_window(train_pl, None, self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
+            train_pred = self._helper._predict(eval_model, train_pl)
             test_pred = self._helper._predict(eval_model, test_pl)
             test_score = float(self._helper._score(test_pl, test_pred))
+
+            saved_train = None
+            if self.save_enabled and self.saver is not None:
+                saved_train = self._helper._save_preds(
+                    train_pl,
+                    train_pred,
+                    meta,
+                    part="train",
+                    params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})),
+                )
 
             saved_test = None
             if self.save_enabled and self.saver is not None:
                 saved_test = self._helper._save_preds(test_pl, test_pred, meta, part="test", params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})))
 
-            # ---- 3) refit final model on train+test ----
-            refit_pl = _combine_payloads(train_pl, test_pl)
+            # ---- 3) refit final model on train+test (future factor set) ----
+            refit_pl = _combine_payloads(refit_train_pl, refit_test_pl)
             final_model, _ = self._helper._fit_one_window(refit_pl, None, self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
 
             # ---- 4) future prediction (separate from test eval) ----
@@ -480,21 +555,23 @@ class RankICRefitRollTrainer:
                 saved_future = self._helper._save_preds(future_pl, future_pred, meta, part="future", params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})))
 
             # save selected factor set artifact (per window)
-            sf_path = str(Path(factors_dir) / f"selected_factors_window_{fold:04d}.json")
-            save_selected_factors_json(selected_factors, fs_state, out_path=sf_path)
+            sf_path_train = str(Path(factors_dir) / f"selected_factors_window_{fold:04d}.json")
+            save_selected_factors_json(train_factors, fs_train_state, out_path=sf_path_train)
+            sf_path_future = str(Path(factors_dir) / f"selected_factors_window_{fold:04d}_future.json")
+            save_selected_factors_json(future_factors, fs_future_state, out_path=sf_path_future)
 
             records.append(
                 {
-                    "window_id": fold,
-                    "train_end": str(w.train_end)[:10],
-                    "test_start": str(w.test_start)[:10],
-                    "test_end": str(w.test_end)[:10],
-                    "future_start": str(w.future_start)[:10],
-                    "future_end": str(w.future_end)[:10],
-                    "n_selected_factors": int(len(selected_factors)),
-                    "factor_selection": fs_state,
+                    **rec_base,
+                    "n_selected_factors": int(len(train_factors)),
+                    "n_selected_factors_train_test": int(len(train_factors)),
+                    "n_selected_factors_future": int(len(future_factors)),
+                    "factor_selection": fs_train_state,
+                    "factor_selection_train_test": fs_train_state,
+                    "factor_selection_future": fs_future_state,
                     "test_score": float(test_score),
                     "future_score": float(future_score),
+                    "saved_train": saved_train,
                     "saved_test": saved_test,
                     "saved_future": saved_future,
                     "skipped": False,
@@ -502,9 +579,10 @@ class RankICRefitRollTrainer:
             )
 
             logger.info(
-                "window done | id=%d | n_factors=%d | test_score=%.6f | future_score=%.6f",
+                "window done | id=%d | n_factors_train_test=%d | n_factors_future=%d | test_score=%.6f | future_score=%.6f",
                 fold,
-                int(len(selected_factors)),
+                int(len(train_factors)),
+                int(len(future_factors)),
                 float(test_score),
                 float(future_score),
             )

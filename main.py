@@ -219,6 +219,43 @@ def _collect_planning_dates_from_dataloader(dl_cfg: Dict[str, Any]) -> List[Any]
     return sorted(pd.to_datetime(s.unique()))
 
 
+def _resolve_window_anchor_date(w: Any, anchor: str, *, default: str) -> Any:
+    """
+    Resolve anchor date from WindowDef-like object.
+    """
+    name = str(anchor or default)
+    if not hasattr(w, name):
+        name = default
+    return getattr(w, name)
+
+
+def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    out = copy.deepcopy(base)
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge_dict(out[k], v)  # type: ignore[index]
+        else:
+            out[k] = copy.deepcopy(v)
+    return out
+
+
+def _extract_sweep_trainer_override(raw_set: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(raw_set, dict):
+        return {}
+    if isinstance(raw_set.get("trainer_params"), dict):
+        return dict(raw_set["trainer_params"])
+    if isinstance(raw_set.get("trainer"), dict):
+        tr = raw_set["trainer"]
+        if isinstance(tr.get("params"), dict):
+            return dict(tr["params"])
+        return dict(tr)
+    out: Dict[str, Any] = {}
+    for k in ("windowing", "factor_selection", "loss", "sample_weighting", "saver"):
+        if isinstance(raw_set.get(k), dict):
+            out[k] = copy.deepcopy(raw_set[k])
+    return out
+
+
 # ======================================================
 # Train / Predict pipeline
 # ======================================================
@@ -304,9 +341,18 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Stage-2 pre-plan:
     # for rankic_refit_roll + factor_selection, precompute a union factor pool
     # and push it into dataloader fields to reduce load/preprocess width.
-    if tr_name == "rankic_refit_roll":
+    if tr_name in ("rankic_refit_roll", "sweep_rankic_refit_roll"):
         fs_cfg = dict(tr_params.get("factor_selection", {}) or {})
         preplan_union = bool(fs_cfg.get("enabled", False)) and bool(fs_cfg.get("preplan_union_to_dataloader", True))
+        if not preplan_union and tr_name == "sweep_rankic_refit_roll":
+            sw_cfg = dict(cfg.get("sweep", {}) or {})
+            for raw_set in (sw_cfg.get("param_sets") or []):
+                tr_over = _extract_sweep_trainer_override(raw_set if isinstance(raw_set, dict) else {})
+                tr_i = _deep_merge_dict(tr_params, tr_over)
+                fs_i = dict(tr_i.get("factor_selection", {}) or {})
+                if bool(fs_i.get("enabled", False)) and bool(fs_i.get("preplan_union_to_dataloader", True)):
+                    preplan_union = True
+                    break
 
         if preplan_union:
             base_pool: List[str] = []
@@ -342,27 +388,119 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     from ret_pred.factor_selection import load_predictions_pkl, select_union_factors_by_rankic
                     from ret_pred.windowing_rankic_refit_roll import build_rankic_refit_roll_windows
 
-                    win_cfg = dict(tr_params.get("windowing", {}) or {})
-                    windows = build_rankic_refit_roll_windows(planning_dates, win_cfg)
-                    asof_dates = [w.factor_selection_asof_date for w in windows]
-
-                    pkl_path = str(fs_cfg.get("predictions_pkl_path", ""))
-                    if not pkl_path:
-                        raise ValueError(
-                            "factor_selection.preplan_union_to_dataloader=true but "
-                            "factor_selection.predictions_pkl_path is empty"
+                    # build preplan specs:
+                    # - single rankic run: one spec from trainer.params
+                    # - sweep rankic run: one spec per param_set override
+                    specs: List[Dict[str, Any]] = []
+                    if tr_name == "rankic_refit_roll":
+                        specs.append(
+                            {
+                                "spec_id": "base",
+                                "windowing": dict(tr_params.get("windowing", {}) or {}),
+                                "factor_selection": dict(fs_cfg),
+                            }
                         )
-                    pred_map = load_predictions_pkl(pkl_path)
+                    else:
+                        sw_cfg = dict(cfg.get("sweep", {}) or {})
+                        param_sets = sw_cfg.get("param_sets") or []
+                        if not isinstance(param_sets, list) or len(param_sets) == 0:
+                            raise ValueError("trainer.name=sweep_rankic_refit_roll but cfg.sweep.param_sets is empty")
+                        for i, raw_set in enumerate(param_sets, start=1):
+                            tr_over = _extract_sweep_trainer_override(raw_set if isinstance(raw_set, dict) else {})
+                            tr_i = _deep_merge_dict(tr_params, tr_over)
+                            fs_i = dict(tr_i.get("factor_selection", {}) or {})
+                            specs.append(
+                                {
+                                    "spec_id": str((raw_set or {}).get("id") or f"set_{i:03d}") if isinstance(raw_set, dict) else f"set_{i:03d}",
+                                    "windowing": dict(tr_i.get("windowing", {}) or {}),
+                                    "factor_selection": fs_i,
+                                }
+                            )
 
-                    union_pool, plan_state = select_union_factors_by_rankic(
-                        pred_map,
-                        asof_dates=asof_dates,
-                        threshold=float(fs_cfg.get("rankic_threshold", fs_cfg.get("threshold", 0.03))),
-                        aggregate=str(fs_cfg.get("aggregate", "abs_mean")),
-                        inclusive=bool(fs_cfg.get("cutoff_inclusive", True)),
-                        min_history_days=int(fs_cfg.get("min_history_days", 1)),
-                        candidate_pool=base_pool,
-                    )
+                    pkl_paths = []
+                    for sp in specs:
+                        fs_i = dict(sp.get("factor_selection", {}) or {})
+                        p = str(fs_i.get("predictions_pkl_path", "")).strip()
+                        if p:
+                            pkl_paths.append(p)
+                    pkl_paths = list(dict.fromkeys(pkl_paths))
+                    if len(pkl_paths) == 0:
+                        raise ValueError(
+                            "factor_selection.preplan_union_to_dataloader=true but predictions_pkl_path is empty"
+                        )
+                    if len(pkl_paths) > 1:
+                        logger.warning("multiple predictions_pkl_path detected in sweep preplan; using first: %s", pkl_paths[0])
+                    pred_map = load_predictions_pkl(pkl_paths[0])
+
+                    union_pool: List[str] = []
+                    union_seen = set()
+                    spec_states: List[Dict[str, Any]] = []
+                    any_no_fs = False
+
+                    for sp in specs:
+                        fs_i = dict(sp.get("factor_selection", {}) or {})
+                        if not bool(fs_i.get("enabled", False)):
+                            any_no_fs = True
+                            spec_states.append({"spec_id": sp.get("spec_id"), "factor_selection_enabled": False})
+                            continue
+
+                        windows = build_rankic_refit_roll_windows(planning_dates, dict(sp.get("windowing", {}) or {}))
+                        selection_mode = str(fs_i.get("selection_mode", "historical_aggregate")).lower()
+                        train_test_anchor = str(fs_i.get("train_test_anchor", "train_start"))
+                        future_anchor = str(fs_i.get("future_anchor", "future_start"))
+                        future_reselect = bool(fs_i.get("future_reselect", selection_mode == "single_day_threshold"))
+
+                        if selection_mode == "single_day_threshold":
+                            train_dates = [_resolve_window_anchor_date(w, train_test_anchor, default="train_start") for w in windows]
+                            future_dates = (
+                                [_resolve_window_anchor_date(w, future_anchor, default="future_start") for w in windows]
+                                if future_reselect
+                                else []
+                            )
+                            asof_dates = list(train_dates) + list(future_dates)
+                        else:
+                            asof_dates = [w.factor_selection_asof_date for w in windows]
+
+                        pool_i, state_i = select_union_factors_by_rankic(
+                            pred_map,
+                            asof_dates=asof_dates,
+                            threshold=float(fs_i.get("rankic_threshold", fs_i.get("threshold", 0.03))),
+                            aggregate=str(fs_i.get("aggregate", "abs_mean")),
+                            inclusive=bool(fs_i.get("cutoff_inclusive", True)),
+                            min_history_days=int(fs_i.get("min_history_days", 1)),
+                            candidate_pool=base_pool,
+                            selection_mode=selection_mode,
+                        )
+                        for f in pool_i:
+                            if f not in union_seen:
+                                union_seen.add(f)
+                                union_pool.append(f)
+
+                        spec_states.append(
+                            {
+                                "spec_id": sp.get("spec_id"),
+                                "factor_selection_enabled": True,
+                                "selection_mode": selection_mode,
+                                "train_test_anchor": train_test_anchor,
+                                "future_anchor": future_anchor,
+                                "future_reselect": bool(future_reselect),
+                                "n_union": int(len(pool_i)),
+                                "state": state_i,
+                            }
+                        )
+
+                    plan_state = {
+                        "trainer_name": tr_name,
+                        "n_specs": int(len(specs)),
+                        "spec_states": spec_states,
+                    }
+                    if any_no_fs:
+                        plan_state["contains_disabled_factor_selection"] = True
+                        logger.warning("rankic preplan: some sweep sets disable factor_selection; fallback includes base_pool")
+                        for f in base_pool:
+                            if f not in union_seen:
+                                union_seen.add(f)
+                                union_pool.append(f)
 
                     if len(union_pool) == 0:
                         logger.warning(
@@ -508,6 +646,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
             update_gate=tr_params.get("update_gate"),
             saver=tr_params.get("saver"),
             model_save=tr_params.get("model_save"),
+            sample_weighting=tr_params.get("sample_weighting"),
             run_id=str(paths.get("run_id")),
             date_col=dl_cfg.date_col,
             stockid_col=dl_cfg.stockid_col,
@@ -601,6 +740,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
             nn_fit=tr_params.get("nn_fit"),
             saver=tr_params.get("saver"),
             model_save=tr_params.get("model_save"),
+            sample_weighting=tr_params.get("sample_weighting"),
             run_id=str(paths.get("run_id")),
             date_col=dl_cfg.date_col,
             stockid_col=dl_cfg.stockid_col,
@@ -700,8 +840,66 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "pred_dir": cfg["paths"]["pred_dir"],
         }
 
+    # =====================================================
+    # Trainer: sweep_rankic_refit_roll
+    # =====================================================
+    elif tr_name == "sweep_rankic_refit_roll":
+        import pandas as pd
+        from ret_pred.trainer.sweep_rankic_refit_roll_trainer import SweepRankICRefitRollTrainer
+
+        date_series = clean_df[dl_cfg.date_col]
+        dates = sorted(pd.to_datetime(date_series.dropna().unique()))
+
+        sweep_cfg = dict(cfg.get("sweep", {}) or {})
+        param_sets = sweep_cfg.get("param_sets") or []
+        if not isinstance(param_sets, list) or len(param_sets) == 0:
+            raise ValueError("trainer.name=sweep_rankic_refit_roll but cfg.sweep.param_sets is empty")
+
+        ev = dict(cfg.get("evaluate", {}) or {})
+        ev_params = dict(ev.get("params", {}) or {})
+
+        tr_params2 = dict(tr_params)
+        tr_params2.setdefault("artifacts_dir", str(paths.get("run_dir")))
+
+        trainer = SweepRankICRefitRollTrainer(
+            model=model_cfg,
+            sweep=sweep_cfg,
+            trainer_params=tr_params2,
+            preprocess_path=str(preprocess_path),
+            datacutting_cfg=cut_cfg,
+            metric=tr_params2.get("metric", "rankic"),
+            maximize=tr_params2.get("maximize", True),
+            task=task_cfg.get("type", "regression"),
+            loss=tr_params2.get("loss"),
+            nn_fit=tr_params2.get("nn_fit"),
+            run_id=str(paths.get("run_id")),
+            date_col=dl_cfg.date_col,
+            stockid_col=dl_cfg.stockid_col,
+            label_col=label_col,
+            device=tr_params2.get("device", "cpu"),
+            seed=int(task_cfg.get("seed", 42)),
+            evaluate=ev_params,
+            out_dir=str(Path(paths["run_dir"]) / "sweeps_rankic"),
+            summary_name=str(tr_params2.get("summary_name", "sweep_rankic_summary.parquet")),
+        )
+
+        summary_df = trainer.run(dates)
+        hist_path = Path(paths["run_dir"]) / "train_history.parquet"
+        summary_df.to_parquet(hist_path, index=False)
+        logger.info("sweep_rankic done | summary_shape=%s", summary_df.shape)
+        logger.info("sweep_rankic summary saved | path=%s", str(hist_path))
+
+        return {
+            "train_history": str(hist_path),
+            "sweep_rankic_dir": str(Path(paths["run_dir"]) / "sweeps_rankic"),
+        }
+
     else:
-        raise KeyError(f"Unknown trainer.name='{tr_name}', expected 'rolling' | 'sweep_rolling' | 'rankic_refit_roll'")
+        raise KeyError(
+            "Unknown trainer.name='{}', expected 'rolling' | 'sweep_rolling' | 'rankic_refit_roll' | 'sweep_rankic_refit_roll'".format(
+                tr_name
+            )
+        )
 
     # NOTE: rolling / sweep_rolling 分支内已 return
 

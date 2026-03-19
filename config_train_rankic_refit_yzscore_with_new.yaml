@@ -1,3 +1,5 @@
+# python -m ret_pred.main --config ret_pred/config_train_rankic_refit_yzscore.yaml
+
 task:
   mode: "train"
   type: "regression"
@@ -16,7 +18,7 @@ logging:
 
 paths:
   runs_root: "/home/quant/projects/ret_pred/runs"
-  run_id: "exp_rankic_refit_roll_2021_2026"
+  run_id: "exp_rankic_refit_005"
   run_dir: "{runs_root}/{run_id}"
   preprocess_dir: "{run_dir}/preprocess"
   model_dir: "{run_dir}/model"
@@ -42,11 +44,11 @@ dataloader:
   # keep [] so stage-2 preplan can inject union pool
   fields: []
   label_name: "y"
-  date_start: "2021-01-04"
+  date_start: "2024-01-04"
   date_end: "2026-02-27"
 
   # base candidate pool for preplan union
-  feature_mask_csv: "/home/quant/projects/factors_2021_2026_from_predictions/field_mask.csv"
+  feature_mask_csv: null
   feature_col_name: "feature"
   feature_use_col: "use"
 
@@ -54,19 +56,27 @@ dataloader:
   label_price_col: "open_1d"
   label_log_return: false
 
-  label_postprocess:
-    enabled: false
+  label_postprocess: #对y做zscore和winsorize
+    enabled: true
     keep_y_raw: false
-    rank_by_date:
+    rank_by_date:                  # 新增：y raw 生成后按日做rank
       enabled: false
       pct: true
       centered: false
       ties_method: "average"
       na_option: "keep"
-    zscore_by_date: { enabled: true, ddof: 0, eps: 1.0e-12 }
-    winsorize_by_date: { enabled: true, lower_q: 0.05, upper_q: 0.95 }
+    zscore_by_date:
+      enabled: true
+      ddof: 0
+      eps: 1.0e-12
+      clip: [-5, 5]     # 新增：zscore后先做硬截断
+    winsorize_by_date:
+      enabled: false
+      lower_q: 0.05
+      upper_q: 0.95
 
-feature_engineering:
+
+feature_engineering:  #特征工程
   enabled: false
   rolling_stats:
     enabled: true
@@ -97,9 +107,9 @@ preprocess:
     upper_q: 0.99
 
   zscore:
-    enabled: false
+    enabled: true
     by: "date"
-    method: "standard"
+    method: "standard" # robust是稳健mad
     ddof: 0
     clip: null
     robust:
@@ -157,6 +167,8 @@ model:
       random_state: 42
       n_jobs: -1
 
+
+
 trainer:
   name: "rankic_refit_roll"
   params:
@@ -167,58 +179,85 @@ trainer:
     windowing:
       mode: "days"
       initial_train_days: 252
-      eval_test_days: 20
-      prediction_horizon_days: 5
-      step_days: null
+      eval_test_days: 5
+      prediction_horizon_days: 1
+      step_days: null    # null = 默认等于 prediction_horizon_ratio
       expanding_train: true
       max_train_days: null
 
+    # windowing:
+    #   mode: "days"
+    #   initial_train_days: 15
+    #   eval_test_days: 3
+    #   prediction_horizon_days: 1
+    #   step_days: null
+    #   expanding_train: true
+    #   max_train_days: null
+
+    # ratio版：
+    # windowing:
+    #   mode: "ratio"
+    #   initial_train_ratio: 0.70
+    #   eval_test_ratio: 0.05
+    #   prediction_horizon_ratio: 0.01
+    #   step_ratio: null                  # null = 默认等于 prediction_horizon_ratio
+    #   min_initial_train_days: 20
+    #   min_eval_test_days: 3
+    #   min_prediction_horizon_days: 1
+    #   expanding_train: true
+    #   max_train_days: null
+
     factor_selection:
       enabled: true
-      preplan_union_to_dataloader: true
-      selection_mode: "single_day_threshold"
-      train_test_anchor: "train_start"
-      future_anchor: "future_start"
-      future_reselect: true
-      predictions_pkl_path: "/home/quant/projects/factors_2021_2026_from_predictions/predictions.pkl"
-      rankic_threshold: 0.03
-      aggregate: "abs_mean"
-      cutoff_inclusive: true
-      min_history_days: 1
-      empty_selection_policy: "fallback_base_pool"
+      preplan_union_to_dataloader: true    # 预规划并集写回 dataloader.fields，减少读取列
+      selection_mode: "single_day_threshold"   # single_day_threshold单日筛选而不是历史聚合| historical_aggregate
+      train_test_anchor: "train_start"         # train_start | train_end | test_start test_end | future_start | future_end
 
-    sample_weighting:
+      future_anchor: "future_start"   # future 阶段在 future 第一天重选因子
+      future_reselect: true
+      predictions_pkl_path: "/home/quant/projects/predictions.pkl"
+      rankic_threshold: 0.03    # 单日阈值规则：abs(rankic) >= rankic_threshold
+
+      # 下面三个参数在 historical_aggregate 模式才生效，保留兼容
+      # aggregate: "abs_mean"
+      # cutoff_inclusive: true
+      # min_history_days: 1
+      # 某次筛选为空时策略
+      empty_selection_policy: "fallback_base_pool"   # fallback_base_pool | skip_window
+
+    sample_weighting:              # 新增：样本加权（近期+极端y，可交叉）
       enabled: false
       recency:
         enabled: false
-        mode: "exp"
+        mode: "exp"               # exp | linear
         half_life_days: 63
         min_weight: 0.2
         max_weight: 1.0
       tail_y:
         enabled: false
-        scope: "global"
-        side: "both"
+        scope: "global"           # global | date
+        side: "both"              # both | upper | lower
         lower_q: 0.1
         upper_q: 0.9
         tail_weight: 2.0
         mid_weight: 1.0
-      combine: "multiply"
-      normalize: "mean1"
+      combine: "multiply"         # multiply | add | max
+      normalize: "mean1"          # mean1 | none
 
     saver:
       enabled: true
       params:
         dir: "{pred_dir}"
-        save_parts: ["test", "future"]
+        save_parts: ["train", "test", "future"]
         file_tpl: "window{fold:04d}_{part}.parquet"
+
 
 evaluate:
   params:
     task: "regression"
     pred_dir: "{pred_dir}"
     out_dir: "{eval_dir}"
-    parts: ["test", "future"]
+    parts: ["train", "test", "future"]
     date_col: "date"
     stockid_col: "stockid"
 
@@ -229,3 +268,62 @@ evaluate:
       preds_filename: "future_preds_all.parquet"
       validate_no_overlap: true
       save_fig: true
+
+    factor_eval:
+      enabled: true
+      strategy: "rankic_refit_roll"
+      input_source: "auto"   # rankic_refit_roll 下会解析到future_stitched
+      value_col: "y_pred"    # 等价你旧脚本 value_col="y_pred"
+
+      out_dir: "{eval_dir}/factor_eval_{strategy}_{source_tag}"
+      source_tag: "future_preds"
+      excess_mode: "both"
+      excess_output_layout: "separate_dirs"
+      meta_filename: "factor_eval_meta.json"
+
+      analysis_params:
+        factor_name: "pred_future"
+
+        # 必填：你旧脚本里的 complete_factor_analysis 参数
+        start_date: 2026-01-01
+        end_date: 2026-03-01
+        frequency: 1
+        factor_direction: "positive"
+        portfolio_type: "long_only"
+        long_groups: [9, 10]
+        short_groups: [1, 2]
+        group_num: 10
+        neutralize: false
+        save_figures: true
+        return_data: true
+        verbose: true
+        eval_price: "open"
+        # enable_turnover_fee: true
+        # turnover_fee_rate: 0.00045
+
+# 新增：rankic_refit_roll 多参数组一次训练（可选）
+# 使用时：把 trainer.name 改为 "sweep_rankic_refit_roll"
+# sweep:
+#   id_prefix: "lgbm"
+#   merge_with_base: true
+#   param_sets:
+#     - id: "lgbm_a"
+#       params:
+#         learning_rate: 0.05
+#         num_leaves: 63
+#       trainer_params:
+#         windowing:
+#           initial_train_days: 252
+#         factor_selection:
+#           rankic_threshold: 0.03
+#     - id: "lgbm_b"
+#       params:
+#         learning_rate: 0.03
+#         num_leaves: 127
+#       trainer_params:
+#         sample_weighting:
+#           enabled: true
+#           recency:
+#             enabled: true
+#             mode: "exp"
+#             half_life_days: 63
