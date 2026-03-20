@@ -57,6 +57,13 @@ def _read_pred_parquets(
     part_col: str = "part",
     max_files: Optional[int] = None,
 ) -> pd.DataFrame:
+    def _schema_cols(path: str) -> Optional[set]:
+        try:
+            import pyarrow.parquet as pq
+            return set(pq.ParquetFile(path).schema.names)
+        except Exception:
+            return None
+
     pattern = os.path.join(str(pred_dir), str(pred_glob))
     files = sorted(glob.glob(pattern, recursive=True))
     if max_files is not None:
@@ -68,7 +75,10 @@ def _read_pred_parquets(
     dfs: List[pd.DataFrame] = []
     skipped = 0
     for fp in files:
-        df = pd.read_parquet(fp)
+        schema = _schema_cols(fp)
+        read_cols = [date_col, stockid_col, value_col, part_col]
+        read_cols = [c for c in read_cols if (schema is None or c in schema)]
+        df = pd.read_parquet(fp, columns=(read_cols if len(read_cols) > 0 else None))
 
         # For factor eval we need at least date/stock/value (y_pred)
         need_cols = [date_col, stockid_col, value_col]
@@ -183,9 +193,9 @@ def dispatch_factor_eval_by_strategy(
         p = Path(future_parquet_path or (Path(eval_dir) / "future" / "future_preds_all.parquet"))
         if not p.exists():
             raise FileNotFoundError(f"future stitched parquet not found: {p}")
-        df = pd.read_parquet(p)
-        # Only keep necessary columns
         need_cols = [date_col, stockid_col, value_col]
+        df = pd.read_parquet(p, columns=need_cols)
+        # Only keep necessary columns
         miss = [c for c in need_cols if c not in df.columns]
         if miss:
             raise KeyError(f"future stitched parquet missing columns {miss}: {p}")
@@ -222,8 +232,8 @@ def dispatch_factor_eval_by_strategy(
         p = Path(future_parquet_path)
         if not p.exists():
             raise FileNotFoundError(f"explicit parquet not found: {p}")
-        df = pd.read_parquet(p)
         need_cols = [date_col, stockid_col, value_col]
+        df = pd.read_parquet(p, columns=need_cols)
         miss = [c for c in need_cols if c not in df.columns]
         if miss:
             raise KeyError(f"explicit parquet missing columns {miss}: {p}")

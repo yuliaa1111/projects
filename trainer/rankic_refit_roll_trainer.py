@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import gc
 import logging
 
 import numpy as np
@@ -417,34 +418,38 @@ class RankICRefitRollTrainer:
                 logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
                 continue
 
-            # read only needed columns (reduce IO)
-            cols = [self.date_col, self.stockid_col, self.label_col] + list(train_factors) + list(future_factors)
-            cols = list(dict.fromkeys(cols))
+            key_cols = [self.date_col, self.stockid_col, self.label_col]
+            train_cols = list(dict.fromkeys(key_cols + list(train_factors)))
+            future_cols = list(dict.fromkeys(key_cols + list(future_factors)))
 
-            # train (<= train_end), test (test_start..test_end), refit (<= test_end), future (future_start..future_end)
+            # Pre-check future availability with key columns only, to keep peak memory low.
+            df_future_keys = _read_part_from_preprocess(
+                self.preprocess_path,
+                date_col=self.date_col,
+                start_date=w.future_start,
+                end_date=w.future_end,
+                columns=key_cols,
+            )
+            n_future_rows = int(len(df_future_keys))
+            del df_future_keys
+
+            # Stage A: read only train/test factor columns for eval model.
             df_train = _read_part_from_preprocess(
                 self.preprocess_path,
                 date_col=self.date_col,
                 start_date=w.train_start,
                 end_date=w.train_end,
-                columns=cols,
+                columns=train_cols,
             )
             df_test = _read_part_from_preprocess(
                 self.preprocess_path,
                 date_col=self.date_col,
                 start_date=w.test_start,
                 end_date=w.test_end,
-                columns=cols,
-            )
-            df_future = _read_part_from_preprocess(
-                self.preprocess_path,
-                date_col=self.date_col,
-                start_date=w.future_start,
-                end_date=w.future_end,
-                columns=cols,
+                columns=train_cols,
             )
 
-            if df_train.empty or df_test.empty or df_future.empty:
+            if df_train.empty or df_test.empty or n_future_rows == 0:
                 records.append(
                     {
                         **rec_base,
@@ -463,28 +468,22 @@ class RankICRefitRollTrainer:
                         "skip_reason": "empty_window_part",
                         "n_train_rows": int(len(df_train)),
                         "n_test_rows": int(len(df_test)),
-                        "n_future_rows": int(len(df_future)),
+                        "n_future_rows": int(n_future_rows),
                     }
                 )
                 logger.warning(
                     "window skipped | id=%d | reason=empty_window_part | n_train=%d n_test=%d n_future=%d",
-                    fold, int(len(df_train)), int(len(df_test)), int(len(df_future)),
+                    fold, int(len(df_train)), int(len(df_test)), int(n_future_rows),
                 )
                 continue
 
-            # train/test use train_factors; future can use future_factors (re-selected at future anchor).
+            # train/test use train_factors
             train_pl = self._cut_part(df_train, feature_cols=train_factors, fold=fold, part="train")
             test_pl = self._cut_part(df_test, feature_cols=train_factors, fold=fold, part="test")
-            refit_train_pl = self._cut_part(df_train, feature_cols=future_factors, fold=fold, part="train_refit")
-            refit_test_pl = self._cut_part(df_test, feature_cols=future_factors, fold=fold, part="test_refit")
-            future_pl = self._cut_part(df_future, feature_cols=future_factors, fold=fold, part="future")
 
             if (
                 self._helper._is_empty_payload(train_pl)
                 or self._helper._is_empty_payload(test_pl)
-                or self._helper._is_empty_payload(refit_train_pl)
-                or self._helper._is_empty_payload(refit_test_pl)
-                or self._helper._is_empty_payload(future_pl)
             ):
                 records.append(
                     {
@@ -504,7 +503,7 @@ class RankICRefitRollTrainer:
                         "skip_reason": "empty_payload_after_cut",
                     }
                 )
-                logger.warning("window skipped | id=%d | reason=empty_payload_after_cut", fold)
+                logger.warning("window skipped | id=%d | reason=empty_train_test_payload_after_cut", fold)
                 continue
 
             meta = {
@@ -542,11 +541,148 @@ class RankICRefitRollTrainer:
             if self.save_enabled and self.saver is not None:
                 saved_test = self._helper._save_preds(test_pl, test_pred, meta, part="test", params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})))
 
+            del train_pred, test_pred
+            gc.collect()
+
             # ---- 3) refit final model on train+test (future factor set) ----
-            refit_pl = _combine_payloads(refit_train_pl, refit_test_pl)
+            # If future factor set differs, re-read train/test with future columns only.
+            if list(train_factors) == list(future_factors):
+                refit_pl = _combine_payloads(train_pl, test_pl)
+            else:
+                # release eval-stage heavy objects before refit-stage read
+                del train_pl, test_pl, df_train, df_test
+                gc.collect()
+
+                df_train_refit = _read_part_from_preprocess(
+                    self.preprocess_path,
+                    date_col=self.date_col,
+                    start_date=w.train_start,
+                    end_date=w.train_end,
+                    columns=future_cols,
+                )
+                df_test_refit = _read_part_from_preprocess(
+                    self.preprocess_path,
+                    date_col=self.date_col,
+                    start_date=w.test_start,
+                    end_date=w.test_end,
+                    columns=future_cols,
+                )
+                if df_train_refit.empty or df_test_refit.empty:
+                    records.append(
+                        {
+                            **rec_base,
+                            "n_selected_factors": int(len(train_factors)),
+                            "n_selected_factors_train_test": int(len(train_factors)),
+                            "n_selected_factors_future": int(len(future_factors)),
+                            "factor_selection": dict(fs_train_state or {}),
+                            "factor_selection_train_test": dict(fs_train_state or {}),
+                            "factor_selection_future": dict(fs_future_state or {}),
+                            "test_score": float(test_score),
+                            "future_score": np.nan,
+                            "saved_train": saved_train,
+                            "saved_test": saved_test,
+                            "saved_future": None,
+                            "skipped": True,
+                            "skip_reason": "empty_refit_train_test_part",
+                            "n_train_rows": int(len(df_train_refit)),
+                            "n_test_rows": int(len(df_test_refit)),
+                            "n_future_rows": int(n_future_rows),
+                        }
+                    )
+                    logger.warning("window skipped | id=%d | reason=empty_refit_train_test_part", fold)
+                    continue
+
+                refit_train_pl = self._cut_part(df_train_refit, feature_cols=future_factors, fold=fold, part="train_refit")
+                refit_test_pl = self._cut_part(df_test_refit, feature_cols=future_factors, fold=fold, part="test_refit")
+                if self._helper._is_empty_payload(refit_train_pl) or self._helper._is_empty_payload(refit_test_pl):
+                    records.append(
+                        {
+                            **rec_base,
+                            "n_selected_factors": int(len(train_factors)),
+                            "n_selected_factors_train_test": int(len(train_factors)),
+                            "n_selected_factors_future": int(len(future_factors)),
+                            "factor_selection": dict(fs_train_state or {}),
+                            "factor_selection_train_test": dict(fs_train_state or {}),
+                            "factor_selection_future": dict(fs_future_state or {}),
+                            "test_score": float(test_score),
+                            "future_score": np.nan,
+                            "saved_train": saved_train,
+                            "saved_test": saved_test,
+                            "saved_future": None,
+                            "skipped": True,
+                            "skip_reason": "empty_refit_payload_after_cut",
+                        }
+                    )
+                    logger.warning("window skipped | id=%d | reason=empty_refit_payload_after_cut", fold)
+                    continue
+
+                refit_pl = _combine_payloads(refit_train_pl, refit_test_pl)
+                del refit_train_pl, refit_test_pl, df_train_refit, df_test_refit
+
             final_model, _ = self._helper._fit_one_window(refit_pl, None, self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
+            del refit_pl
+            train_pl = None
+            test_pl = None
+            df_train = None
+            df_test = None
+            gc.collect()
 
             # ---- 4) future prediction (separate from test eval) ----
+            df_future = _read_part_from_preprocess(
+                self.preprocess_path,
+                date_col=self.date_col,
+                start_date=w.future_start,
+                end_date=w.future_end,
+                columns=future_cols,
+            )
+            if df_future.empty:
+                records.append(
+                    {
+                        **rec_base,
+                        "n_selected_factors": int(len(train_factors)),
+                        "n_selected_factors_train_test": int(len(train_factors)),
+                        "n_selected_factors_future": int(len(future_factors)),
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": dict(fs_future_state or {}),
+                        "test_score": float(test_score),
+                        "future_score": np.nan,
+                        "saved_train": saved_train,
+                        "saved_test": saved_test,
+                        "saved_future": None,
+                        "skipped": True,
+                        "skip_reason": "empty_future_part_after_refit",
+                        "n_future_rows": 0,
+                    }
+                )
+                logger.warning("window skipped | id=%d | reason=empty_future_part_after_refit", fold)
+                continue
+
+            future_pl = self._cut_part(df_future, feature_cols=future_factors, fold=fold, part="future")
+            del df_future
+            gc.collect()
+            if self._helper._is_empty_payload(future_pl):
+                records.append(
+                    {
+                        **rec_base,
+                        "n_selected_factors": int(len(train_factors)),
+                        "n_selected_factors_train_test": int(len(train_factors)),
+                        "n_selected_factors_future": int(len(future_factors)),
+                        "factor_selection": dict(fs_train_state or {}),
+                        "factor_selection_train_test": dict(fs_train_state or {}),
+                        "factor_selection_future": dict(fs_future_state or {}),
+                        "test_score": float(test_score),
+                        "future_score": np.nan,
+                        "saved_train": saved_train,
+                        "saved_test": saved_test,
+                        "saved_future": None,
+                        "skipped": True,
+                        "skip_reason": "empty_future_payload_after_cut",
+                    }
+                )
+                logger.warning("window skipped | id=%d | reason=empty_future_payload_after_cut", fold)
+                continue
+
             future_pred = self._helper._predict(final_model, future_pl)
             future_score = float(self._helper._score(future_pl, future_pred))
 

@@ -100,6 +100,59 @@ def _infer_feature_cols(df: pd.DataFrame, date_col: str, stockid_col: str, label
     return [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
 
 
+def _iter_feature_blocks(feature_cols: List[str], block_size: Optional[int]) -> List[List[str]]:
+    """
+    Split feature columns into fixed-size blocks.
+    """
+    if not feature_cols:
+        return []
+    bs = int(block_size or 0)
+    if bs <= 0 or bs >= len(feature_cols):
+        return [list(feature_cols)]
+    return [feature_cols[i:i + bs] for i in range(0, len(feature_cols), bs)]
+
+
+def _nan_ratio_col_blockwise(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    *,
+    block_size: int,
+) -> pd.Series:
+    """
+    Compute per-column NaN ratio with bounded peak memory.
+    """
+    if not feature_cols:
+        return pd.Series(dtype=float)
+    out = []
+    idx = []
+    for blk in _iter_feature_blocks(feature_cols, block_size):
+        s = df[blk].isna().mean()
+        out.append(s.values)
+        idx.extend(list(s.index))
+    if not out:
+        return pd.Series(dtype=float)
+    arr = np.concatenate(out, axis=0)
+    return pd.Series(arr, index=idx, dtype=float)
+
+
+def _nan_ratio_row_blockwise(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    *,
+    block_size: int,
+) -> pd.Series:
+    """
+    Compute per-row NaN ratio with bounded peak memory.
+    """
+    n = int(len(df))
+    if n == 0 or not feature_cols:
+        return pd.Series(np.zeros(n, dtype=float), index=df.index)
+    miss = np.zeros(n, dtype=np.float64)
+    for blk in _iter_feature_blocks(feature_cols, block_size):
+        miss += df[blk].isna().sum(axis=1).to_numpy(dtype=np.float64, copy=False)
+    return pd.Series(miss / float(len(feature_cols)), index=df.index, dtype=float)
+
+
 def _basic_fix(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
     """
     最基础的数据清洗：
@@ -144,7 +197,11 @@ def _drop_y_missing(df: pd.DataFrame, label_col: str) -> Tuple[pd.DataFrame, int
 
 
 def _drop_bad_cols(
-    df: pd.DataFrame, feature_cols: List[str], col_drop_threshold: float
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    col_drop_threshold: float,
+    *,
+    block_size: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, List[str], pd.Series]:
     """
     在 fit 阶段按“列缺失率”剔除坏特征列。
@@ -167,13 +224,26 @@ def _drop_bad_cols(
     """
     if not feature_cols:
         return df, [], pd.Series(dtype=float)
-    nan_ratio_col = df[feature_cols].isna().mean()
+    if col_drop_threshold >= 1.0:
+        nan_ratio_col = pd.Series(0.0, index=feature_cols, dtype=float)
+        return df, [], nan_ratio_col
+
+    if block_size and int(block_size) > 0:
+        nan_ratio_col = _nan_ratio_col_blockwise(df, feature_cols, block_size=int(block_size))
+    else:
+        nan_ratio_col = df[feature_cols].isna().mean()
     drop_cols = nan_ratio_col[nan_ratio_col > col_drop_threshold].index.tolist()
     out = df.drop(columns=drop_cols) if drop_cols else df
     return out, drop_cols, nan_ratio_col
 
 
-def _drop_bad_rows(df: pd.DataFrame, feature_cols: List[str], row_drop_threshold: float) -> Tuple[pd.DataFrame, int]:
+def _drop_bad_rows(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    row_drop_threshold: float,
+    *,
+    block_size: Optional[int] = None,
+) -> Tuple[pd.DataFrame, int]:
     """
     在 fit 阶段按“行缺失率”剔除坏样本行。
 
@@ -193,7 +263,13 @@ def _drop_bad_rows(df: pd.DataFrame, feature_cols: List[str], row_drop_threshold
     """
     if not feature_cols:
         return df, 0
-    nan_ratio_row = df[feature_cols].isna().mean(axis=1)
+    if row_drop_threshold >= 1.0:
+        return df, 0
+
+    if block_size and int(block_size) > 0:
+        nan_ratio_row = _nan_ratio_row_blockwise(df, feature_cols, block_size=int(block_size))
+    else:
+        nan_ratio_row = df[feature_cols].isna().mean(axis=1)
     bad = nan_ratio_row > row_drop_threshold
     dropped = int(bad.sum())
     out = df.loc[~bad].copy()
@@ -570,6 +646,178 @@ def _validate(df: pd.DataFrame, date_col: str, stockid_col: str, feature_cols: L
             raise ValueError(f"strict nan_policy requires no NaN in features, found {remain}")
 
 
+def _iter_date_chunks(df: pd.DataFrame, date_col: str, chunk_days: int) -> List[pd.DatetimeIndex]:
+    """
+    Split unique sorted trading dates into chunks.
+    """
+    if chunk_days <= 0:
+        raise ValueError(f"chunk_days must be > 0, got: {chunk_days}")
+    d = pd.to_datetime(df[date_col], errors="coerce").dropna().drop_duplicates().sort_values()
+    vals = d.to_numpy()
+    out: List[pd.DatetimeIndex] = []
+    for i in range(0, len(vals), int(chunk_days)):
+        out.append(pd.DatetimeIndex(vals[i:i + int(chunk_days)]))
+    return out
+
+
+def _process_fit_chunked_to_parquet(
+    df: pd.DataFrame,
+    *,
+    save_path: str,
+    date_col: str,
+    stockid_col: str,
+    label_col: str,
+    base_feature_cols: List[str],
+    nan_policy: str,
+    fill_method: str,
+    ffill_limit: int,
+    do_fill_for_tree: bool,
+    add_missing_mask: bool,
+    win_enabled: bool,
+    win_by: str,
+    win_lq: float,
+    win_uq: float,
+    z_enabled: bool,
+    z_by: str,
+    z_method: str,
+    z_ddof: int,
+    z_clip: Optional[float],
+    z_robust: Optional[Dict[str, Any]],
+    chunk_days: int,
+    cast_float32: bool,
+) -> Tuple[pd.DataFrame, List[str], Dict[str, Any], Dict[str, Any]]:
+    """
+    Fit preprocess in date chunks and stream to ONE parquet file.
+
+    Output df is a lightweight key dataframe (date/stockid/[label]) for downstream date splitting.
+    """
+    # Current chunked implementation keeps exact semantics for by='date' transforms.
+    # For by='global', statistics depend on full-sample estimation and are not implemented here.
+    if win_enabled and str(win_by).lower() != "date":
+        raise ValueError("chunked preprocess currently supports winsorize.by='date' only")
+    if z_enabled and str(z_by).lower() != "date":
+        raise ValueError("chunked preprocess currently supports zscore.by='date' only")
+
+    # ffill across chunks needs carry state by stock; not implemented in this first version.
+    if fill_method in {"ffill_then_zero", "ffill_all"} and (nan_policy == "strict" or do_fill_for_tree):
+        raise ValueError(
+            "chunked preprocess does not support fill_method=ffill_* with active fill; "
+            "please use zero/mean/median or disable fill for tree_friendly mode"
+        )
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception as e:
+        raise ImportError("chunked preprocess requires pyarrow for streaming parquet write") from e
+
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+    mask_cols: List[str] = [f"{c}__miss" for c in base_feature_cols] if add_missing_mask else []
+    feature_cols = list(base_feature_cols) + list(mask_cols)
+    keep_key_cols = [date_col, stockid_col] + ([label_col] if label_col in df.columns else [])
+
+    chunks = _iter_date_chunks(df, date_col, chunk_days)
+    if len(chunks) == 0:
+        empty = df.loc[:, [c for c in keep_key_cols if c in df.columns]].copy()
+        empty.to_parquet(save_path, index=False)
+        return empty.reset_index(drop=True), mask_cols, {"fill_method": "none", "fill_steps": []}, {}
+
+    writer = None
+    key_parts: List[pd.DataFrame] = []
+    fill_state_last: Dict[str, Any] = {}
+    trans_state_last: Dict[str, Any] = {}
+
+    try:
+        for ds in chunks:
+            part = df[df[date_col].isin(ds)].copy()
+            if part.empty:
+                continue
+
+            # step 4) missing mask before fill
+            if add_missing_mask:
+                part, _ = _add_missing_mask(part, base_feature_cols)
+
+            # step 5) fill
+            if nan_policy == "strict":
+                part, fill_state = _fill_features(
+                    part,
+                    base_feature_cols,
+                    date_col,
+                    stockid_col,
+                    fill_method=fill_method,
+                    ffill_limit=ffill_limit,
+                )
+            elif nan_policy == "tree_friendly":
+                if do_fill_for_tree:
+                    part, fill_state = _fill_features(
+                        part,
+                        base_feature_cols,
+                        date_col,
+                        stockid_col,
+                        fill_method=fill_method,
+                        ffill_limit=ffill_limit,
+                    )
+                else:
+                    fill_state = {"fill_method": "none", "fill_steps": []}
+            else:
+                raise ValueError(f"unknown nan_policy: {nan_policy}")
+            fill_state_last = fill_state
+
+            # step 6) winsorize + zscore
+            trans_state = {}
+            if win_enabled:
+                part, st = _winsorize(
+                    part,
+                    base_feature_cols,
+                    by=win_by,
+                    date_col=date_col,
+                    lower_q=win_lq,
+                    upper_q=win_uq,
+                    state_stats=None,
+                )
+                trans_state.update(st)
+            if z_enabled:
+                part, st = _zscore(
+                    part,
+                    base_feature_cols,
+                    by=z_by,
+                    date_col=date_col,
+                    method=z_method,
+                    ddof=z_ddof,
+                    clip=z_clip,
+                    robust_cfg=z_robust,
+                    state_stats=None,
+                )
+                trans_state.update(st)
+            trans_state_last = trans_state
+
+            final_cols = [date_col, stockid_col]
+            if label_col in part.columns:
+                final_cols.append(label_col)
+            final_cols += list(base_feature_cols) + list(mask_cols)
+            final_cols = [c for c in final_cols if c in part.columns]
+            part_out = part.sort_values([date_col, stockid_col]).reset_index(drop=True).loc[:, final_cols]
+
+            if cast_float32 and base_feature_cols:
+                part_out[base_feature_cols] = part_out[base_feature_cols].astype(np.float32, copy=False)
+
+            _validate(part_out, date_col, stockid_col, feature_cols, nan_policy)
+
+            key_parts.append(part_out.loc[:, [c for c in keep_key_cols if c in part_out.columns]].copy())
+
+            table = pa.Table.from_pandas(part_out, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(save_path, table.schema)
+            writer.write_table(table)
+    finally:
+        if writer is not None:
+            writer.close()
+
+    df_keys = pd.concat(key_parts, ignore_index=True) if key_parts else df.loc[:, [c for c in keep_key_cols if c in df.columns]].iloc[:0].copy()
+    return df_keys.reset_index(drop=True), mask_cols, fill_state_last, trans_state_last
+
+
 def _json_friendly(x: Any) -> Any:
     """
     将 numpy 标量转换为可 JSON 序列化的 python 原生类型。
@@ -740,6 +988,13 @@ def _preprocess_core(
     z_clip = None if z_clip is None else float(z_clip)
     z_robust = (z_cfg.get("robust", {}) or {})
 
+    # chunked preprocess (fit only)
+    chunk_cfg = (cfg.get("chunked", {}) or {})
+    chunk_enabled = bool(chunk_cfg.get("enabled", False))
+    chunk_days = int(chunk_cfg.get("chunk_days", 20))
+    nan_scan_block_size = int(chunk_cfg.get("nan_scan_block_size", 64))
+    chunk_cast_float32 = bool(chunk_cfg.get("cast_float32", True))
+
     # outputs
     save_parquet = bool(cfg.get("save_parquet", False))
     save_path_tpl = str(cfg.get("save_path", "./cache/preprocessed_{label}_{date_start}_{date_end}.parquet"))
@@ -781,9 +1036,19 @@ def _preprocess_core(
     df2 = df1
     if mode == "fit":
         # 先删坏列，再重新推断一次（避免 label/key 外的列结构变化）
-        df2, drop_cols, nan_ratio_col = _drop_bad_cols(df1, base_feature_cols, col_drop_threshold)
+        df2, drop_cols, nan_ratio_col = _drop_bad_cols(
+            df1,
+            base_feature_cols,
+            col_drop_threshold,
+            block_size=(nan_scan_block_size if chunk_enabled else None),
+        )
         base_feature_cols = _infer_feature_cols(df2, date_col, stockid_col, label_col)
-        df3, dropped_rows = _drop_bad_rows(df2, base_feature_cols, row_drop_threshold)
+        df3, dropped_rows = _drop_bad_rows(
+            df2,
+            base_feature_cols,
+            row_drop_threshold,
+            block_size=(nan_scan_block_size if chunk_enabled else None),
+        )
     else:
         # transform：尽量对齐 fit 阶段的 base_feature_cols（维度一致非常关键）
         df3 = df2.copy()
@@ -797,6 +1062,103 @@ def _preprocess_core(
         else:
             # 如果 state 不可用，就退化为“当前数据推断”
             base_feature_cols = _infer_feature_cols(df3, date_col, stockid_col, label_col)
+
+    # 占位符渲染映射（chunked 与 legacy 共用）
+    mapping = {
+        "runs_root": str(meta.get("runs_root", "")),
+        "run_id": str(meta.get("run_id", meta.get("exp_id", ""))),
+        "mode": str(mode),
+        "label": str(label_col),
+        "date_start": str(meta.get("date_start", ""))[:10],
+        "date_end": str(meta.get("date_end", ""))[:10],
+    }
+
+    # -------------------------
+    # 3.5) chunked fit path (stream write parquet)
+    # -------------------------
+    if mode == "fit" and chunk_enabled and save_parquet:
+        chunk_save_path = _render_placeholders(save_path_tpl, mapping)
+        logger.info(
+            "preprocess chunked mode | chunk_days=%d | nan_scan_block_size=%d | cast_float32=%s | save_path=%s",
+            int(chunk_days),
+            int(nan_scan_block_size),
+            bool(chunk_cast_float32),
+            str(chunk_save_path),
+        )
+
+        try:
+            df_out, mask_cols, fill_state, trans_state = _process_fit_chunked_to_parquet(
+                df3,
+                save_path=chunk_save_path,
+                date_col=date_col,
+                stockid_col=stockid_col,
+                label_col=label_col,
+                base_feature_cols=base_feature_cols,
+                nan_policy=nan_policy,
+                fill_method=fill_method,
+                ffill_limit=ffill_limit,
+                do_fill_for_tree=do_fill_for_tree,
+                add_missing_mask=add_missing_mask,
+                win_enabled=win_enabled,
+                win_by=win_by,
+                win_lq=win_lq,
+                win_uq=win_uq,
+                z_enabled=z_enabled,
+                z_by=z_by,
+                z_method=z_method,
+                z_ddof=z_ddof,
+                z_clip=z_clip,
+                z_robust=z_robust,
+                chunk_days=chunk_days,
+                cast_float32=chunk_cast_float32,
+            )
+        except Exception:
+            logger.exception("chunked preprocess failed; fallback to legacy full-memory path")
+        else:
+            feature_cols = list(base_feature_cols) + list(mask_cols)
+            _validate(df_out, date_col, stockid_col, [], nan_policy)
+
+            out_state: Dict[str, Any] = {
+                "mode": mode,
+                "n_in": int(len(df0)),
+                "n_out": int(len(df_out)),
+                "dropped_y_rows": int(dropped_y),
+                "dropped_rows_by_nan_ratio": int(dropped_rows),
+                "dropped_feature_cols": drop_cols,
+                "nan_ratio_col": nan_ratio_col.to_dict() if len(nan_ratio_col) else {},
+                "nan_policy": nan_policy,
+                "base_feature_cols": list(base_feature_cols),
+                "mask_cols": list(mask_cols),
+                "feature_cols": list(feature_cols),
+                **fill_state,
+                **trans_state,
+                "cfg_echo": {
+                    "col_drop_threshold": col_drop_threshold,
+                    "row_drop_threshold": row_drop_threshold,
+                    "add_missing_mask": add_missing_mask,
+                    "do_fill_for_tree": do_fill_for_tree,
+                    "fill_method": fill_method,
+                    "ffill_limit": ffill_limit,
+                    "winsorize": dict(wins_cfg),
+                    "zscore": dict(z_cfg),
+                    "chunked": dict(chunk_cfg),
+                },
+                "saved_path": str(chunk_save_path),
+            }
+
+            if save_state_json:
+                spath = _render_placeholders(state_path_tpl, mapping)
+                Path(spath).parent.mkdir(parents=True, exist_ok=True)
+                with open(spath, "w", encoding="utf-8") as f:
+                    json.dump(out_state, f, ensure_ascii=False, indent=2, default=_json_friendly)
+                out_state["saved_state_path"] = str(spath)
+                logger.info("preprocess state saved | path=%s", spath)
+
+            logger.info(
+                "preprocess end | mode=%s | out_shape=%s | n_base_feats=%d | n_mask_feats=%d",
+                mode, df_out.shape, len(base_feature_cols), len(mask_cols)
+            )
+            return df_out, out_state
 
     # -------------------------
     # 4) missing mask (before fill)
@@ -958,15 +1320,6 @@ def _preprocess_core(
     # 9) save parquet / state (fit only)
     # -------------------------
     # 落盘路径支持 meta 占位符渲染（通常由 main/runner 注入）
-    mapping = {
-        "runs_root": str(meta.get("runs_root", "")),
-        "run_id": str(meta.get("run_id", meta.get("exp_id", ""))),
-        "mode": str(mode),
-        "label": str(label_col),
-        "date_start": str(meta.get("date_start", ""))[:10],
-        "date_end": str(meta.get("date_end", ""))[:10],
-    }
-
     if save_parquet and mode == "fit":
         path = _render_placeholders(save_path_tpl, mapping)
         Path(path).parent.mkdir(parents=True, exist_ok=True)

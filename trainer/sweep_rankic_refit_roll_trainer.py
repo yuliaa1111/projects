@@ -43,6 +43,29 @@ def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str
     return out
 
 
+def _jsonify_parquet_unsafe_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert nested object columns (dict/list/tuple) to JSON strings so pyarrow parquet
+    does not fail on empty struct/map inference.
+    """
+    def _is_missing(x: Any) -> bool:
+        return x is None or (isinstance(x, (float, np.floating)) and np.isnan(x))
+
+    out = df.copy()
+    for c in out.columns:
+        s = out[c]
+        if s.dtype != "object":
+            continue
+        non_na = [x for x in s.tolist() if not _is_missing(x)]
+        if len(non_na) == 0:
+            continue
+        if any(isinstance(x, (dict, list, tuple)) for x in non_na):
+            out[c] = s.apply(
+                lambda x: None if _is_missing(x) else json.dumps(x, ensure_ascii=False, default=str)
+            )
+    return out
+
+
 class SweepRankICRefitRollTrainer:
     def __init__(
         self,
@@ -189,9 +212,10 @@ class SweepRankICRefitRollTrainer:
             )
 
         summary_df = pd.DataFrame(rows)
+        summary_df_safe = _jsonify_parquet_unsafe_cols(summary_df)
         summary_path = out_root / self.summary_name
-        summary_df.to_parquet(summary_path, index=False)
-        logger.info("sweep_rankic done | summary_shape=%s | saved=%s", summary_df.shape, str(summary_path))
+        summary_df_safe.to_parquet(summary_path, index=False)
+        logger.info("sweep_rankic done | summary_shape=%s | saved=%s", summary_df_safe.shape, str(summary_path))
 
         try:
             js = out_root / (Path(self.summary_name).stem + ".json")
@@ -216,7 +240,7 @@ class SweepRankICRefitRollTrainer:
         except Exception:
             logger.exception("failed to save sweep_rankic summary json (non-critical)")
 
-        return summary_df
+        return summary_df_safe
 
     def _make_sweep_id(self, i: int, raw_set: Dict[str, Any], n: int) -> str:
         if isinstance(raw_set, dict) and isinstance(raw_set.get("id"), str) and raw_set["id"].strip():
@@ -312,4 +336,3 @@ class SweepRankICRefitRollTrainer:
             metrics["rows"] = int(len(res.metrics_df))
             metrics["parts"] = res.metrics_df.get("part", pd.Series(dtype=object)).astype(str).tolist()
         return metrics
-

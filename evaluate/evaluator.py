@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import os
 import glob
+import gc
 import logging
 
 import numpy as np
@@ -54,6 +55,11 @@ class Evaluator:
         max_files: Optional[int] = None,
         return_pred_df: bool = False,
         q_bins: int = 10,
+        load_columns: Optional[List[str]] = None,
+        load_cast_float32: bool = False,
+        load_part_as_category: bool = True,
+        plot_max_rows: Optional[int] = None,
+        plot_sample_seed: int = 42,
 
         stitch_regression: bool = True,
         stitch_keep_individual: bool = False,
@@ -80,6 +86,11 @@ class Evaluator:
         self.max_files = max_files
         self.return_pred_df = return_pred_df
         self.q_bins = int(q_bins)
+        self.load_columns = list(load_columns) if isinstance(load_columns, list) else None
+        self.load_cast_float32 = bool(load_cast_float32)
+        self.load_part_as_category = bool(load_part_as_category)
+        self.plot_max_rows = int(plot_max_rows) if plot_max_rows is not None else None
+        self.plot_sample_seed = int(plot_sample_seed)
 
         self.stitch_regression = bool(stitch_regression)
         self.stitch_keep_individual = bool(stitch_keep_individual)
@@ -186,10 +197,15 @@ class Evaluator:
 
             logger.info("Evaluator run end | figs=%d", len(fig_paths))
 
+            pred_out = pred_df if self.return_pred_df else None
+            if not self.return_pred_df:
+                pred_df = None
+                gc.collect()
+
             return EvalResult(
                 metrics_df=metrics_df,
                 fig_paths=fig_paths,
-                pred_df=pred_df if self.return_pred_df else None,
+                pred_df=pred_out,
             )
 
         except Exception:
@@ -199,6 +215,35 @@ class Evaluator:
     # -------------------------
     # Load
     # -------------------------
+    def _get_parquet_schema_columns(self, fp: str) -> Optional[set]:
+        try:
+            import pyarrow.parquet as pq
+            return set(pq.ParquetFile(fp).schema.names)
+        except Exception:
+            return None
+
+    def _required_load_columns(self) -> List[str]:
+        if self.load_columns is not None and len(self.load_columns) > 0:
+            cols = list(dict.fromkeys([str(c) for c in self.load_columns]))
+            if "y_true" not in cols:
+                cols.append("y_true")
+            if "y_pred" not in cols:
+                cols.append("y_pred")
+            return cols
+        return list(
+            dict.fromkeys(
+                [
+                    self.date_col,
+                    self.stockid_col,
+                    "part",
+                    "fold",
+                    "step_id",
+                    "y_true",
+                    "y_pred",
+                ]
+            )
+        )
+
     def _load_preds(self) -> pd.DataFrame:
         pattern = os.path.join(self.pred_dir, self.pred_glob)
         files = sorted(glob.glob(pattern, recursive=True))
@@ -212,14 +257,29 @@ class Evaluator:
 
         dfs = []
         skipped = 0
+        req_cols = self._required_load_columns()
         for fp in files:
-            df = pd.read_parquet(fp)
+            schema_cols = self._get_parquet_schema_columns(fp)
+            if schema_cols is not None and (("y_true" not in schema_cols) or ("y_pred" not in schema_cols)):
+                logger.info("skip file without y_true/y_pred | file=%s", fp)
+                skipped += 1
+                continue
+
+            read_cols = [c for c in req_cols if (schema_cols is None or c in schema_cols)]
+            df = pd.read_parquet(fp, columns=(read_cols if len(read_cols) > 0 else None))
 
             # 🔥 关键：跳过没有 y_true/y_pred 的文件（例如 infer 文件）
             if not {"y_true", "y_pred"}.issubset(df.columns):
                 logger.info("skip file without y_true/y_pred | file=%s | cols=%s", fp, list(df.columns))
                 skipped += 1
                 continue
+
+            if self.load_cast_float32:
+                try:
+                    df["y_true"] = pd.to_numeric(df["y_true"], errors="coerce").astype(np.float32)
+                    df["y_pred"] = pd.to_numeric(df["y_pred"], errors="coerce").astype(np.float32)
+                except Exception:
+                    logger.warning("load_cast_float32 failed for file=%s", fp)
 
             df["_source_file"] = os.path.basename(fp)
             dfs.append(df)
@@ -234,6 +294,11 @@ class Evaluator:
         if "part" not in pred_df.columns:
             pred_df["part"] = "test"
             logger.warning("pred_df missing 'part' column, defaulting all to 'test'")
+        elif self.load_part_as_category:
+            try:
+                pred_df["part"] = pred_df["part"].astype("category")
+            except Exception:
+                logger.warning("failed to cast pred_df.part to category")
 
         before = len(pred_df)
         pred_df = pred_df[pred_df["part"].isin(self.parts)]
@@ -465,30 +530,58 @@ class Evaluator:
     # -------------------------
     # Plots
     # -------------------------
+    def _sample_for_plot(self, pred_df: pd.DataFrame) -> pd.DataFrame:
+        if self.plot_max_rows is None or self.plot_max_rows <= 0:
+            return pred_df
+        n = int(len(pred_df))
+        if n <= int(self.plot_max_rows):
+            return pred_df
+
+        target = int(self.plot_max_rows)
+        rs = int(self.plot_sample_seed)
+
+        if "part" in pred_df.columns:
+            parts = pred_df["part"].astype(str)
+            out_parts = []
+            for part_name in sorted(parts.unique().tolist()):
+                g = pred_df[parts == part_name]
+                k = max(1, int(round(target * len(g) / n)))
+                k = min(k, int(len(g)))
+                out_parts.append(g.sample(n=k, random_state=rs) if k < len(g) else g)
+            out = pd.concat(out_parts, ignore_index=True)
+            if len(out) > target:
+                out = out.sample(n=target, random_state=rs).reset_index(drop=True)
+        else:
+            out = pred_df.sample(n=target, random_state=rs).reset_index(drop=True)
+
+        logger.info("plot sampling applied | before=%d | after=%d", n, int(len(out)))
+        return out
+
     def _make_plots(self, pred_df: pd.DataFrame) -> List[str]:
+        plot_df = self._sample_for_plot(pred_df)
         logger.info(
             "make plots | task=%s | date_col_present=%s | parts=%s",
-            self.task, (self.date_col in pred_df.columns), sorted(pred_df["part"].unique().tolist()) if "part" in pred_df.columns else None
+            self.task, (self.date_col in plot_df.columns), sorted(plot_df["part"].astype(str).unique().tolist()) if "part" in plot_df.columns else None
         )
 
         paths: List[str] = []
 
         if self.task == "regression":
             # 8 figures (regression)
-            if self.date_col in pred_df.columns:
-                paths.append(self._plot_time_curve_all(pred_df))          # time_curve_true_vs_pred.png
-                paths.append(self._plot_time_curve_by_part(pred_df))      # time_curve_true_vs_pred_by_part.png
-                paths.append(self._plot_residual_time_curve(pred_df))     # residual_time_curve.png
-                paths.append(self._plot_quantile_mean_line(pred_df))      # quantile_mean_return.png
-                paths.append(self._plot_quantile_cum_bar(pred_df))        # quantile_cum_return_bar.png
-                paths.append(self._plot_rankic_distribution(pred_df))     # rankic_distribution.png
-            paths.append(self._plot_scatter(pred_df))                     # scatter_true_vs_pred.png
-            paths.append(self._plot_residual_hist(pred_df))               # residual_hist.png
+            if self.date_col in plot_df.columns:
+                paths.append(self._plot_time_curve_all(plot_df))          # time_curve_true_vs_pred.png
+                paths.append(self._plot_time_curve_by_part(plot_df))      # time_curve_true_vs_pred_by_part.png
+                paths.append(self._plot_residual_time_curve(plot_df))     # residual_time_curve.png
+                paths.append(self._plot_quantile_mean_line(plot_df))      # quantile_mean_return.png
+                paths.append(self._plot_quantile_cum_bar(plot_df))        # quantile_cum_return_bar.png
+                paths.append(self._plot_rankic_distribution(plot_df))     # rankic_distribution.png
+            paths.append(self._plot_scatter(plot_df))                     # scatter_true_vs_pred.png
+            paths.append(self._plot_residual_hist(plot_df))               # residual_hist.png
         else:
             # classification plots (3)
-            paths.append(self._plot_roc(pred_df))
-            paths.append(self._plot_pr(pred_df))
-            paths.append(self._plot_confusion(pred_df))
+            paths.append(self._plot_roc(plot_df))
+            paths.append(self._plot_pr(plot_df))
+            paths.append(self._plot_confusion(plot_df))
 
         paths2 = [p for p in paths if p]
         logger.info("make plots done | n=%d", len(paths2))

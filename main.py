@@ -50,6 +50,7 @@ ret_pred/main.py
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import os
 import random
@@ -566,13 +567,24 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     pp_cfg.setdefault("save_parquet", True)  # 训练默认落盘，以便后续 streaming windows
 
     clean_df, pp_state = preprocess_long(long_df, pp_cfg, meta=meta)
+    # long_df is no longer needed after preprocess
+    long_df = None
 
     preprocess_path = pp_state.get("saved_path") or pp_state.get("save_path")
     if not preprocess_path:
         raise ValueError("preprocess did not return saved_path; please ensure preprocess.save_parquet=True")
 
-    logger.info("preprocess done | shape=%s", clean_df.shape)
+    import pandas as pd
+    all_dates = sorted(pd.to_datetime(clean_df[dl_cfg.date_col], errors="coerce").dropna().unique())
+    dates_df = pd.DataFrame({dl_cfg.date_col: all_dates})
+
+    logger.info("preprocess done | shape=%s | n_unique_dates=%d", clean_df.shape, int(len(all_dates)))
     logger.info("preprocess parquet | path=%s", preprocess_path)
+
+    # release large in-memory dataframe as early as possible; downstream trainers stream from parquet
+    clean_df = None
+    gc.collect()
+    logger.info("memory released after preprocess | kept=dates_df/preprocess_path")
 
     # -------------------------
     # C) datasplit（dates only; only for rolling/sweep_rolling）
@@ -585,7 +597,6 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
         sp_cfg["return_dfs"] = False
         sp_cfg["save_parquet"] = False
 
-        dates_df = clean_df[[dl_cfg.date_col]]
         meta2 = dict(meta, preprocess_state=pp_state, run_id=paths.get("run_id"))
 
         folds, _ = datasplit_long(dates_df, sp_cfg, meta=meta2)
@@ -784,13 +795,11 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Trainer: rankic_refit_roll (NEW strategy)
     # =====================================================
     elif tr_name == "rankic_refit_roll":
-        import pandas as pd
         from ret_pred.trainer.rankic_refit_roll_trainer import RankICRefitRollTrainer
 
         # rankic_refit_roll does its own windowing based on date index (no datasplit/windows generator)
         # It still relies on preprocess parquet for data slicing to keep memory bounded.
-        date_series = clean_df[dl_cfg.date_col]
-        dates = sorted(pd.to_datetime(date_series.dropna().unique()))
+        dates = list(all_dates)
 
         # Provide a default artifacts_dir under run_dir for reproducibility
         tr_params2 = dict(tr_params)
@@ -844,11 +853,9 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     # Trainer: sweep_rankic_refit_roll
     # =====================================================
     elif tr_name == "sweep_rankic_refit_roll":
-        import pandas as pd
         from ret_pred.trainer.sweep_rankic_refit_roll_trainer import SweepRankICRefitRollTrainer
 
-        date_series = clean_df[dl_cfg.date_col]
-        dates = sorted(pd.to_datetime(date_series.dropna().unique()))
+        dates = list(all_dates)
 
         sweep_cfg = dict(cfg.get("sweep", {}) or {})
         param_sets = sweep_cfg.get("param_sets") or []
