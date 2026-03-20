@@ -909,6 +909,366 @@ def preprocess_long(
     return preprocess_fit_transform(long_df, cfg, meta=meta)
 
 
+def _read_parquet_date_slice(
+    path: str,
+    *,
+    date_col: str,
+    date_start: pd.Timestamp,
+    date_end: pd.Timestamp,
+    columns: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    cols = list(dict.fromkeys(columns or [])) if columns else None
+    try:
+        return pd.read_parquet(
+            path,
+            columns=cols,
+            filters=[(date_col, ">=", date_start), (date_col, "<=", date_end)],
+        )
+    except TypeError:
+        df = pd.read_parquet(path, columns=cols)
+        s = pd.to_datetime(df[date_col], errors="coerce")
+        return df[(s >= date_start) & (s <= date_end)].copy()
+
+
+def preprocess_fit_transform_from_parquet(
+    source_parquet_path: str,
+    cfg: Dict[str, Any],
+    *,
+    meta: Optional[Dict[str, Any]] = None,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """
+    Low-memory fit preprocess path:
+    read source parquet by date chunks, transform chunk-wise, and stream-write ONE output parquet.
+
+    Notes:
+    - Designed for ret_pred lowmem path where source parquet is already date-range filtered.
+    - Requires preprocess.chunked.enabled=true and preprocess.save_parquet=true.
+    - Currently supports col_drop_threshold >= 1.0 (no global column-drop scan).
+    """
+    meta = meta or {}
+    src = Path(str(source_parquet_path))
+    if not src.exists():
+        raise FileNotFoundError(f"preprocess source parquet not found: {src}")
+
+    date_col = cfg.get("date_col", "date")
+    stockid_col = cfg.get("stockid_col", "stockid")
+    label_col = cfg.get("label_col", "y")
+
+    col_drop_threshold = float(cfg.get("col_drop_threshold", 0.20))
+    row_drop_threshold = float(cfg.get("row_drop_threshold", 0.20))
+    nan_policy = str(cfg.get("nan_policy", "strict"))
+    fill_method = str(cfg.get("fill_method", "ffill_then_zero"))
+    ffill_limit = int(cfg.get("ffill_limit", 5))
+    do_fill_for_tree = bool(cfg.get("do_fill_for_tree", False))
+    add_missing_mask = bool(cfg.get("add_missing_mask", False))
+
+    wins_cfg = (cfg.get("winsorize", {}) or {})
+    win_enabled = bool(wins_cfg.get("enabled", False))
+    win_by = str(wins_cfg.get("by", "date"))
+    win_lq = float(wins_cfg.get("lower_q", 0.01))
+    win_uq = float(wins_cfg.get("upper_q", 0.99))
+
+    z_cfg = (cfg.get("zscore", {}) or {})
+    z_enabled = bool(z_cfg.get("enabled", False))
+    z_by = str(z_cfg.get("by", "date"))
+    z_method = str(z_cfg.get("method", "standard"))
+    z_ddof = int(z_cfg.get("ddof", 0))
+    z_clip = z_cfg.get("clip", None)
+    z_clip = None if z_clip is None else float(z_clip)
+    z_robust = (z_cfg.get("robust", {}) or {})
+
+    chunk_cfg = (cfg.get("chunked", {}) or {})
+    chunk_enabled = bool(chunk_cfg.get("enabled", False))
+    chunk_days = int(chunk_cfg.get("chunk_days", 20))
+    nan_scan_block_size = int(chunk_cfg.get("nan_scan_block_size", 64))
+    chunk_cast_float32 = bool(chunk_cfg.get("cast_float32", True))
+
+    save_parquet = bool(cfg.get("save_parquet", False))
+    save_path_tpl = str(cfg.get("save_path", "./cache/preprocessed_{label}_{date_start}_{date_end}.parquet"))
+    save_state_json = bool(cfg.get("save_state_json", False))
+    state_path_tpl = str(cfg.get("state_path", "./cache/preprocess_state_{mode}_{label}_{date_start}_{date_end}.json"))
+
+    if not chunk_enabled:
+        raise ValueError("preprocess_fit_transform_from_parquet requires preprocess.chunked.enabled=true")
+    if not save_parquet:
+        raise ValueError("preprocess_fit_transform_from_parquet requires preprocess.save_parquet=true")
+    if col_drop_threshold < 1.0:
+        raise ValueError(
+            "lowmem preprocess from parquet currently requires col_drop_threshold >= 1.0 "
+            "(global column-drop scan is not implemented yet)"
+        )
+
+    if win_enabled and str(win_by).lower() != "date":
+        raise ValueError("lowmem preprocess from parquet supports winsorize.by='date' only")
+    if z_enabled and str(z_by).lower() != "date":
+        raise ValueError("lowmem preprocess from parquet supports zscore.by='date' only")
+    if fill_method in {"ffill_then_zero", "ffill_all"} and (nan_policy == "strict" or do_fill_for_tree):
+        raise ValueError(
+            "lowmem preprocess from parquet does not support fill_method=ffill_* with active fill; "
+            "please use zero/mean/median or disable fill for tree_friendly mode"
+        )
+
+    mapping = {
+        "runs_root": str(meta.get("runs_root", "")),
+        "run_id": str(meta.get("run_id", meta.get("exp_id", ""))),
+        "mode": "fit",
+        "label": str(label_col),
+        "date_start": str(meta.get("date_start", ""))[:10],
+        "date_end": str(meta.get("date_end", ""))[:10],
+    }
+    save_path = _render_placeholders(save_path_tpl, mapping)
+    Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+
+    logger.info(
+        "preprocess(parquet) start | source=%s | chunk_days=%d | nan_scan_block_size=%d | cast_float32=%s",
+        str(src),
+        int(chunk_days),
+        int(nan_scan_block_size),
+        bool(chunk_cast_float32),
+    )
+
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception as e:
+        raise ImportError("preprocess_fit_transform_from_parquet requires pyarrow") from e
+
+    schema = pq.ParquetFile(str(src)).schema_arrow
+    schema_names = [str(f.name) for f in schema]
+    if date_col not in schema_names or stockid_col not in schema_names:
+        raise KeyError(f"source parquet must contain key cols: {date_col}, {stockid_col}")
+
+    exclude = {date_col, stockid_col, label_col, f"{label_col}_raw"}
+    base_feature_cols = [c for c in schema_names if c not in exclude and not c.endswith("__miss")]
+    mask_cols = [f"{c}__miss" for c in base_feature_cols] if add_missing_mask else []
+    feature_cols = list(base_feature_cols) + list(mask_cols)
+
+    d = pd.read_parquet(str(src), columns=[date_col])
+    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+    all_dates = sorted(d[date_col].dropna().drop_duplicates())
+    if len(all_dates) == 0:
+        final_cols = [date_col, stockid_col, label_col] + feature_cols
+        pd.DataFrame(columns=list(dict.fromkeys(final_cols))).to_parquet(save_path, index=False)
+        out_state = {
+            "mode": "fit",
+            "n_in": 0,
+            "n_out": 0,
+            "dropped_y_rows": 0,
+            "dropped_rows_by_nan_ratio": 0,
+            "dropped_feature_cols": [],
+            "nan_ratio_col": {},
+            "nan_policy": nan_policy,
+            "base_feature_cols": list(base_feature_cols),
+            "mask_cols": list(mask_cols),
+            "feature_cols": list(feature_cols),
+            "saved_path": str(save_path),
+            "all_dates": [],
+            "cfg_echo": {
+                "col_drop_threshold": col_drop_threshold,
+                "row_drop_threshold": row_drop_threshold,
+                "add_missing_mask": add_missing_mask,
+                "do_fill_for_tree": do_fill_for_tree,
+                "fill_method": fill_method,
+                "ffill_limit": ffill_limit,
+                "winsorize": dict(wins_cfg),
+                "zscore": dict(z_cfg),
+                "chunked": dict(chunk_cfg),
+            },
+        }
+        return pd.DataFrame(columns=[date_col]), out_state
+
+    chunks = _iter_date_chunks(pd.DataFrame({date_col: all_dates}), date_col, chunk_days)
+    keep_key_cols = [date_col, stockid_col, label_col] if label_col in schema_names else [date_col, stockid_col]
+    total_in = 0
+    total_out = 0
+    dropped_y = 0
+    dropped_rows = 0
+    seen_dates: List[pd.Timestamp] = []
+    fill_state_last: Dict[str, Any] = {"fill_method": "none", "fill_steps": []}
+    trans_state_last: Dict[str, Any] = {}
+
+    writer = None
+    try:
+        for i, ds in enumerate(chunks, start=1):
+            if len(ds) == 0:
+                continue
+            sdt = pd.Timestamp(ds[0])
+            edt = pd.Timestamp(ds[-1])
+            read_cols = keep_key_cols + list(base_feature_cols)
+            read_cols = [c for c in read_cols if c in schema_names]
+            part = _read_parquet_date_slice(
+                str(src),
+                date_col=date_col,
+                date_start=sdt,
+                date_end=edt,
+                columns=read_cols,
+            )
+            if part.empty:
+                continue
+
+            part = _basic_fix(part, date_col)
+            total_in += int(len(part))
+
+            if label_col in part.columns:
+                before = len(part)
+                part, dy = _drop_y_missing(part, label_col)
+                dropped_y += int(dy)
+                if before > 0 and len(part) == 0:
+                    logger.info(
+                        "preprocess(parquet) chunk skipped after label drop | chunk=%d/%d | date=[%s,%s]",
+                        int(i), int(len(chunks)), str(sdt.date()), str(edt.date())
+                    )
+                    continue
+
+            if row_drop_threshold < 1.0 and len(base_feature_cols) > 0:
+                part, dr = _drop_bad_rows(
+                    part,
+                    base_feature_cols,
+                    row_drop_threshold,
+                    block_size=(nan_scan_block_size if nan_scan_block_size > 0 else None),
+                )
+                dropped_rows += int(dr)
+                if part.empty:
+                    continue
+
+            if add_missing_mask:
+                part, _ = _add_missing_mask(part, base_feature_cols)
+
+            if nan_policy == "strict":
+                part, fill_state = _fill_features(
+                    part,
+                    base_feature_cols,
+                    date_col,
+                    stockid_col,
+                    fill_method=fill_method,
+                    ffill_limit=ffill_limit,
+                )
+            elif nan_policy == "tree_friendly":
+                if do_fill_for_tree:
+                    part, fill_state = _fill_features(
+                        part,
+                        base_feature_cols,
+                        date_col,
+                        stockid_col,
+                        fill_method=fill_method,
+                        ffill_limit=ffill_limit,
+                    )
+                else:
+                    fill_state = {"fill_method": "none", "fill_steps": []}
+            else:
+                raise ValueError(f"unknown nan_policy: {nan_policy}")
+            fill_state_last = fill_state
+
+            trans_state = {}
+            if win_enabled:
+                part, st = _winsorize(
+                    part,
+                    base_feature_cols,
+                    by=win_by,
+                    date_col=date_col,
+                    lower_q=win_lq,
+                    upper_q=win_uq,
+                    state_stats=None,
+                )
+                trans_state.update(st)
+            if z_enabled:
+                part, st = _zscore(
+                    part,
+                    base_feature_cols,
+                    by=z_by,
+                    date_col=date_col,
+                    method=z_method,
+                    ddof=z_ddof,
+                    clip=z_clip,
+                    robust_cfg=z_robust,
+                    state_stats=None,
+                )
+                trans_state.update(st)
+            trans_state_last = trans_state
+
+            final_cols = [date_col, stockid_col]
+            if label_col in part.columns:
+                final_cols.append(label_col)
+            final_cols += list(base_feature_cols) + list(mask_cols)
+            final_cols = [c for c in final_cols if c in part.columns]
+            part_out = part.sort_values([date_col, stockid_col]).reset_index(drop=True).loc[:, final_cols]
+
+            if chunk_cast_float32 and base_feature_cols:
+                part_out[base_feature_cols] = part_out[base_feature_cols].astype(np.float32, copy=False)
+
+            _validate(part_out, date_col, stockid_col, feature_cols, nan_policy)
+
+            table = pa.Table.from_pandas(part_out, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(save_path, table.schema)
+            writer.write_table(table)
+
+            seen_dates.extend(list(pd.to_datetime(part_out[date_col], errors="coerce").dropna().drop_duplicates()))
+            total_out += int(len(part_out))
+            logger.info(
+                "preprocess(parquet) chunk done | chunk=%d/%d | date=[%s,%s] | rows=%d",
+                int(i), int(len(chunks)), str(sdt.date()), str(edt.date()), int(len(part_out))
+            )
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if not Path(save_path).exists():
+        final_cols = [date_col, stockid_col] + ([label_col] if label_col in schema_names else []) + feature_cols
+        pd.DataFrame(columns=list(dict.fromkeys(final_cols))).to_parquet(save_path, index=False)
+
+    unique_dates = sorted(pd.to_datetime(pd.Series(seen_dates), errors="coerce").dropna().drop_duplicates())
+    dates_df = pd.DataFrame({date_col: unique_dates})
+
+    out_state: Dict[str, Any] = {
+        "mode": "fit",
+        "n_in": int(total_in),
+        "n_out": int(total_out),
+        "dropped_y_rows": int(dropped_y),
+        "dropped_rows_by_nan_ratio": int(dropped_rows),
+        "dropped_feature_cols": [],
+        "nan_ratio_col": {},
+        "nan_policy": nan_policy,
+        "base_feature_cols": list(base_feature_cols),
+        "mask_cols": list(mask_cols),
+        "feature_cols": list(feature_cols),
+        **fill_state_last,
+        **trans_state_last,
+        "cfg_echo": {
+            "col_drop_threshold": col_drop_threshold,
+            "row_drop_threshold": row_drop_threshold,
+            "add_missing_mask": add_missing_mask,
+            "do_fill_for_tree": do_fill_for_tree,
+            "fill_method": fill_method,
+            "ffill_limit": ffill_limit,
+            "winsorize": dict(wins_cfg),
+            "zscore": dict(z_cfg),
+            "chunked": dict(chunk_cfg),
+        },
+        "saved_path": str(save_path),
+        "source_path": str(src),
+        "all_dates": [str(pd.Timestamp(x).date()) for x in unique_dates],
+    }
+
+    if save_state_json:
+        spath = _render_placeholders(state_path_tpl, mapping)
+        Path(spath).parent.mkdir(parents=True, exist_ok=True)
+        with open(spath, "w", encoding="utf-8") as f:
+            json.dump(out_state, f, ensure_ascii=False, indent=2, default=_json_friendly)
+        out_state["saved_state_path"] = str(spath)
+        logger.info("preprocess state saved | path=%s", spath)
+
+    logger.info(
+        "preprocess(parquet) end | out_rows=%d | n_dates=%d | n_base_feats=%d | n_mask_feats=%d | saved=%s",
+        int(total_out),
+        int(len(unique_dates)),
+        int(len(base_feature_cols)),
+        int(len(mask_cols)),
+        str(save_path),
+    )
+    return dates_df.reset_index(drop=True), out_state
+
+
 # =========================
 # core
 # =========================

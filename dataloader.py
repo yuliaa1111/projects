@@ -121,6 +121,13 @@ class DLCfg:
     # expected dict schema: see ret_pred/md/data.md and ret_pred/md/tasks.md
     label_postprocess: Optional[Dict[str, Any]] = None
 
+    # low-memory multi-long loading (optional)
+    lowmem_enabled: bool = False
+    lowmem_chunk_days: int = 20
+    lowmem_cast_float32: bool = True
+    lowmem_temp_dir: Optional[str] = None
+    lowmem_output_path: Optional[str] = None
+
 
 # =========================
 # Label postprocess (NEW)
@@ -630,6 +637,217 @@ def _merge_long_parts(
     return out
 
 
+def _iter_date_chunks(dates: List[pd.Timestamp], chunk_days: int) -> List[List[pd.Timestamp]]:
+    if chunk_days <= 0:
+        raise ValueError(f"lowmem_chunk_days must be > 0, got: {chunk_days}")
+    if len(dates) == 0:
+        return []
+    out: List[List[pd.Timestamp]] = []
+    for i in range(0, len(dates), int(chunk_days)):
+        out.append(list(dates[i:i + int(chunk_days)]))
+    return out
+
+
+def _collect_unique_dates_from_parquet(
+    path: Path,
+    *,
+    date_col: str,
+    date_start: str,
+    date_end: str,
+) -> List[pd.Timestamp]:
+    d = _read_long_part_with_date_filter(
+        path,
+        columns=[date_col],
+        date_col=date_col,
+        date_start=date_start,
+        date_end=date_end,
+    )[date_col]
+    return sorted(pd.to_datetime(d, errors="coerce").dropna().drop_duplicates())
+
+
+def _resolve_lowmem_output_path(cfg: DLCfg, req: DLRequest) -> Path:
+    if cfg.lowmem_output_path:
+        p = Path(str(cfg.lowmem_output_path))
+    else:
+        root = Path(str(cfg.lowmem_temp_dir or (Path(cfg.parquet_dir) / "_dataloader_tmp")))
+        p = root / f"merged_long_{str(req.date_start)[:10]}_{str(req.date_end)[:10]}.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.exists():
+        try:
+            p.unlink()
+        except Exception:
+            pass
+    return p
+
+
+def _cast_numeric_float32_inplace(df: pd.DataFrame, *, exclude: Optional[set] = None) -> None:
+    exclude = exclude or set()
+    cols = [c for c in df.columns if c not in exclude and pd.api.types.is_float_dtype(df[c])]
+    for c in cols:
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype(np.float32, copy=False)
+
+
+def _stream_merge_multi_long_to_parquet(
+    *,
+    req: DLRequest,
+    cfg: DLCfg,
+    long_paths: List[Path],
+    schema_by_path: Dict[Path, List[str]],
+    fields: List[str],
+    label_try: List[str],
+) -> Tuple[Path, Dict[str, Any]]:
+    """
+    Low-memory path:
+    - Read multi-long parts by date chunks
+    - Merge within chunk
+    - Optional label construction and label_postprocess
+    - Stream write one merged parquet
+    """
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except Exception as e:
+        raise ImportError("lowmem multi-long merge requires pyarrow") from e
+
+    out_path = _resolve_lowmem_output_path(cfg, req)
+
+    # date axis from first path is enough for chunk scheduling in practice
+    all_dates = _collect_unique_dates_from_parquet(
+        long_paths[0],
+        date_col=cfg.date_col,
+        date_start=req.date_start,
+        date_end=req.date_end,
+    )
+    date_chunks = _iter_date_chunks(all_dates, int(cfg.lowmem_chunk_days))
+
+    need_cols = [cfg.date_col, cfg.stockid_col] + list(fields)
+    for c in label_try:
+        if c not in need_cols:
+            need_cols.append(c)
+    if cfg.build_label and cfg.label_price_col not in need_cols:
+        need_cols.append(cfg.label_price_col)
+
+    writer = None
+    wrote_rows = 0
+    wrote_chunks = 0
+
+    try:
+        for ci, core_dates in enumerate(date_chunks):
+            if len(core_dates) == 0:
+                continue
+
+            # Build read range with +2 lookahead for label shift(-1/-2)
+            core_start = pd.Timestamp(core_dates[0])
+            core_end = pd.Timestamp(core_dates[-1])
+            if cfg.build_label and req.label_name:
+                end_idx = min(len(all_dates) - 1, (ci + 1) * int(cfg.lowmem_chunk_days) - 1 + 2)
+                read_end = pd.Timestamp(all_dates[end_idx])
+            else:
+                read_end = core_end
+
+            df = None
+            for i, p in enumerate(long_paths):
+                available = set(schema_by_path[p])
+                cols = [c for c in need_cols if c in available]
+                if cfg.date_col not in cols:
+                    cols.append(cfg.date_col)
+                if cfg.stockid_col not in cols:
+                    cols.append(cfg.stockid_col)
+                if i > 0 and len(cols) == 2:
+                    continue
+
+                part = _read_long_part_with_date_filter(
+                    p,
+                    columns=cols,
+                    date_col=cfg.date_col,
+                    date_start=str(core_start.date()),
+                    date_end=str(read_end.date()),
+                )
+                if cfg.lowmem_cast_float32:
+                    _cast_numeric_float32_inplace(part, exclude={cfg.date_col, cfg.stockid_col})
+                if df is None:
+                    df = part
+                else:
+                    keys = [cfg.date_col, cfg.stockid_col]
+                    dup_cols = [c for c in part.columns if c in df.columns and c not in keys]
+                    if dup_cols:
+                        part = part.drop(columns=dup_cols)
+                    df = df.merge(part, on=keys, how=cfg.long_merge_how, sort=False)
+
+            if df is None:
+                continue
+
+            # label rename / build
+            df = _rename_label_if_needed(df, cfg.label_src, req.label_name)
+            if req.label_name and cfg.build_label and req.label_name not in df.columns:
+                df = build_forward_return_label_long(
+                    df,
+                    date_col=cfg.date_col,
+                    stockid_col=cfg.stockid_col,
+                    price_col=cfg.label_price_col,
+                    label_name=req.label_name,
+                    log_return=cfg.label_log_return,
+                )
+
+            # keep only core dates (drop lookahead tail used only for label construction)
+            core_set = set(pd.to_datetime(core_dates))
+            df = df[pd.to_datetime(df[cfg.date_col], errors="coerce").isin(core_set)].copy()
+            if df.empty:
+                continue
+
+            # label postprocess
+            if req.label_name and req.label_name in df.columns:
+                df = apply_label_postprocess(
+                    df,
+                    cfg.label_postprocess,
+                    date_col=cfg.date_col,
+                    label_col=req.label_name,
+                )
+
+            keep = [cfg.date_col, cfg.stockid_col]
+            if req.label_name and req.label_name in df.columns:
+                keep.append(req.label_name)
+            keep += list(fields)
+            keep = list(dict.fromkeys([c for c in keep if c in df.columns]))
+            df = df[keep].copy()
+
+            validate_long(df, cfg.date_col, cfg.stockid_col, cfg.check_unique_key)
+
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if writer is None:
+                writer = pq.ParquetWriter(str(out_path), table.schema)
+            writer.write_table(table)
+
+            wrote_rows += int(len(df))
+            wrote_chunks += 1
+            logger.info(
+                "multi-long lowmem chunk written | chunk=%d/%d | core_date=[%s,%s] | read_end=%s | rows=%d cols=%d",
+                int(ci + 1),
+                int(len(date_chunks)),
+                str(core_start.date()),
+                str(core_end.date()),
+                str(read_end.date()),
+                int(len(df)),
+                int(len(df.columns)),
+            )
+    finally:
+        if writer is not None:
+            writer.close()
+
+    if not out_path.exists():
+        raise RuntimeError("lowmem merge produced no parquet output")
+
+    state = {
+        "lowmem_enabled": True,
+        "lowmem_chunk_days": int(cfg.lowmem_chunk_days),
+        "lowmem_output_path": str(out_path),
+        "lowmem_written_rows": int(wrote_rows),
+        "lowmem_written_chunks": int(wrote_chunks),
+        "n_unique_dates": int(len(all_dates)),
+    }
+    return out_path, state
+
+
 def _auto_infer_fields_from_long_df(
     df: pd.DataFrame,
     *,
@@ -781,6 +999,33 @@ def load_long(req: DLRequest, cfg: DLCfg, *, client=None) -> Tuple[pd.DataFrame,
                 need_cols.append(c)
         if cfg.build_label and cfg.label_price_col not in need_cols:
             need_cols.append(cfg.label_price_col)
+
+        # low-memory path: stream merge multi-long to one parquet and return lightweight stub df.
+        if bool(cfg.lowmem_enabled):
+            out_path, lm_state = _stream_merge_multi_long_to_parquet(
+                req=req,
+                cfg=cfg,
+                long_paths=long_paths,
+                schema_by_path=schema_by_path,
+                fields=fields,
+                label_try=label_try,
+            )
+            meta.update(lm_state)
+            meta["input_format"] = "multi_long_lowmem_stream"
+            meta["fields_after_mask"] = list(fields)
+            meta["fields_filtered_by_mask"] = bool(cfg.feature_mask_csv)
+
+            logger.info(
+                "load_long done (multi-long lowmem) | output=%s | written_rows=%d | written_chunks=%d",
+                str(out_path),
+                int(lm_state.get("lowmem_written_rows", 0)),
+                int(lm_state.get("lowmem_written_chunks", 0)),
+            )
+
+            stub_cols = [cfg.date_col, cfg.stockid_col]
+            if req.label_name:
+                stub_cols.append(req.label_name)
+            return pd.DataFrame(columns=stub_cols), meta
 
         parts: List[pd.DataFrame] = []
         for i, p in enumerate(long_paths):

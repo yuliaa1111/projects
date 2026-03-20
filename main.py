@@ -288,7 +288,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
         filter_fields_by_mask,
     )
     from ret_pred.feature_engineering import run_feature_engineering
-    from ret_pred.preprocess import preprocess_long
+    from ret_pred.preprocess import preprocess_long, preprocess_fit_transform_from_parquet
     from ret_pred.split import datasplit_long
     from ret_pred.windows import build_streaming_windows
     from ret_pred.evaluate.evaluator import Evaluator
@@ -313,6 +313,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     # DLCfg：描述数据源与字段约定
+    dl_lowmem = dict(dl.get("lowmem", {}) or {})
     dl_cfg = DLCfg(
         source=dl.get("source", "parquet_dir"),
         parquet_dir=dl.get("parquet_dir", "./data"),
@@ -333,6 +334,12 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
         label_log_return=bool(dl.get("label_log_return", False)),
         # label 后处理（optional; default disabled）
         label_postprocess=dl.get("label_postprocess"),
+        # low-memory multi-long stream merge (optional)
+        lowmem_enabled=bool(dl_lowmem.get("enabled", dl.get("lowmem_enabled", False))),
+        lowmem_chunk_days=int(dl_lowmem.get("chunk_days", dl.get("lowmem_chunk_days", 20))),
+        lowmem_cast_float32=bool(dl_lowmem.get("cast_float32", dl.get("lowmem_cast_float32", True))),
+        lowmem_temp_dir=dl_lowmem.get("temp_dir", dl.get("lowmem_temp_dir")),
+        lowmem_output_path=dl_lowmem.get("output_path", dl.get("lowmem_output_path")),
     )
 
     tr_cfg = cfg.get("trainer", {})
@@ -539,23 +546,6 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     logger.info("dataloader done | shape=%s", long_df.shape)
 
     # -------------------------
-    # A2) feature engineering（optional; before preprocess）
-    # -------------------------
-    fe_cfg = dict(cfg.get("feature_engineering", {}) or {})
-    if fe_cfg.get("enabled", False):
-        long_df, fe_state = run_feature_engineering(
-            long_df,
-            fe_cfg,
-            date_col=dl_cfg.date_col,
-            stockid_col=dl_cfg.stockid_col,
-            feature_cols=None,  # let feature_engineering infer numeric features
-            label_col=label_col,
-        )
-        meta = dict(meta, feature_engineering=fe_state)
-        n_new = int(((fe_state.get("rolling_stats") or {}).get("n_created") or 0)) if isinstance(fe_state, dict) else 0
-        logger.info("feature_engineering applied | shape=%s | n_new=%d", long_df.shape, n_new)
-
-    # -------------------------
     # B) preprocess (FIT)
     # -------------------------
     # preprocess_long 通常会：清洗缺失/inf，winsorize，zscore，填充策略等
@@ -565,17 +555,50 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
     pp_cfg = dict(cfg.get("preprocess", {}))
     pp_cfg["label_col"] = label_col
     pp_cfg.setdefault("save_parquet", True)  # 训练默认落盘，以便后续 streaming windows
+    fe_cfg = dict(cfg.get("feature_engineering", {}) or {})
+    lowmem_source_path = str((meta or {}).get("lowmem_output_path", "")).strip()
 
-    clean_df, pp_state = preprocess_long(long_df, pp_cfg, meta=meta)
-    # long_df is no longer needed after preprocess
-    long_df = None
+    if lowmem_source_path:
+        if fe_cfg.get("enabled", False):
+            raise ValueError(
+                "feature_engineering.enabled=true is not supported with dataloader.lowmem.enabled=true yet"
+            )
+        clean_df, pp_state = preprocess_fit_transform_from_parquet(
+            lowmem_source_path,
+            pp_cfg,
+            meta=meta,
+        )
+        long_df = None
+    else:
+        # -------------------------
+        # A2) feature engineering（optional; before preprocess）
+        # -------------------------
+        if fe_cfg.get("enabled", False):
+            long_df, fe_state = run_feature_engineering(
+                long_df,
+                fe_cfg,
+                date_col=dl_cfg.date_col,
+                stockid_col=dl_cfg.stockid_col,
+                feature_cols=None,  # let feature_engineering infer numeric features
+                label_col=label_col,
+            )
+            meta = dict(meta, feature_engineering=fe_state)
+            n_new = int(((fe_state.get("rolling_stats") or {}).get("n_created") or 0)) if isinstance(fe_state, dict) else 0
+            logger.info("feature_engineering applied | shape=%s | n_new=%d", long_df.shape, n_new)
+
+        clean_df, pp_state = preprocess_long(long_df, pp_cfg, meta=meta)
+        # long_df is no longer needed after preprocess
+        long_df = None
 
     preprocess_path = pp_state.get("saved_path") or pp_state.get("save_path")
     if not preprocess_path:
         raise ValueError("preprocess did not return saved_path; please ensure preprocess.save_parquet=True")
 
     import pandas as pd
-    all_dates = sorted(pd.to_datetime(clean_df[dl_cfg.date_col], errors="coerce").dropna().unique())
+    if isinstance(pp_state.get("all_dates"), list) and len(pp_state.get("all_dates")) > 0:
+        all_dates = sorted(pd.to_datetime(pd.Series(pp_state.get("all_dates")), errors="coerce").dropna().unique())
+    else:
+        all_dates = sorted(pd.to_datetime(clean_df[dl_cfg.date_col], errors="coerce").dropna().unique())
     dates_df = pd.DataFrame({dl_cfg.date_col: all_dates})
 
     logger.info("preprocess done | shape=%s | n_unique_dates=%d", clean_df.shape, int(len(all_dates)))

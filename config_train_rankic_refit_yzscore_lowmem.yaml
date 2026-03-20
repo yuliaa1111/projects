@@ -40,6 +40,12 @@ dataloader:
     - "/home/quant/projects/factors_2021_2026_from_predictions/tmp_parquet_chunks/chunk_500_600.parquet"
     - "/home/quant/projects/factors_2021_2026_from_predictions/tmp_parquet_chunks/chunk_600_700.parquet"
   long_merge_how: "inner"
+  lowmem:
+    enabled: true
+    chunk_days: 20
+    cast_float32: true
+    temp_dir: "{run_dir}/tmp_dataloader"
+    output_path: "{run_dir}/tmp_dataloader/merged_long.parquet"
 
   # keep [] so stage-2 preplan can inject union pool
   fields: []
