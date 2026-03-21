@@ -444,6 +444,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     union_seen = set()
                     spec_states: List[Dict[str, Any]] = []
                     any_no_fs = False
+                    total_asof_dates = 0
 
                     for sp in specs:
                         fs_i = dict(sp.get("factor_selection", {}) or {})
@@ -454,20 +455,26 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
 
                         windows = build_rankic_refit_roll_windows(planning_dates, dict(sp.get("windowing", {}) or {}))
                         selection_mode = str(fs_i.get("selection_mode", "historical_aggregate")).lower()
+                        selection_scope = str(fs_i.get("selection_scope", "dual_stage")).lower()
                         train_test_anchor = str(fs_i.get("train_test_anchor", "train_start"))
                         future_anchor = str(fs_i.get("future_anchor", "future_start"))
                         future_reselect = bool(fs_i.get("future_reselect", selection_mode == "single_day_threshold"))
+                        future_single_set = selection_scope in {"future_only_single_set", "future_single_set", "future_only"}
 
                         if selection_mode == "single_day_threshold":
                             train_dates = [_resolve_window_anchor_date(w, train_test_anchor, default="train_start") for w in windows]
-                            future_dates = (
-                                [_resolve_window_anchor_date(w, future_anchor, default="future_start") for w in windows]
-                                if future_reselect
-                                else []
-                            )
-                            asof_dates = list(train_dates) + list(future_dates)
+                            future_dates = [_resolve_window_anchor_date(w, future_anchor, default="future_start") for w in windows]
+                            if future_single_set:
+                                asof_dates = list(future_dates)
+                            else:
+                                asof_dates = list(train_dates) + (list(future_dates) if future_reselect else [])
                         else:
-                            asof_dates = [w.factor_selection_asof_date for w in windows]
+                            if future_single_set:
+                                asof_dates = [_resolve_window_anchor_date(w, future_anchor, default="future_start") for w in windows]
+                            else:
+                                asof_dates = [w.factor_selection_asof_date for w in windows]
+
+                        total_asof_dates += int(len(asof_dates))
 
                         pool_i, state_i = select_union_factors_by_rankic(
                             pred_map,
@@ -489,9 +496,12 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                 "spec_id": sp.get("spec_id"),
                                 "factor_selection_enabled": True,
                                 "selection_mode": selection_mode,
+                                "selection_scope": selection_scope,
                                 "train_test_anchor": train_test_anchor,
                                 "future_anchor": future_anchor,
                                 "future_reselect": bool(future_reselect),
+                                "future_single_set": bool(future_single_set),
+                                "n_asof_dates": int(len(asof_dates)),
                                 "n_union": int(len(pool_i)),
                                 "state": state_i,
                             }
@@ -500,6 +510,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                     plan_state = {
                         "trainer_name": tr_name,
                         "n_specs": int(len(specs)),
+                        "n_asof_dates": int(total_asof_dates),
                         "spec_states": spec_states,
                     }
                     if any_no_fs:

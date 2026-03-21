@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+import copy
 import gc
 import logging
 
@@ -139,6 +140,186 @@ def _resolve_window_anchor_date(w: Any, anchor: Optional[str], *, default: str =
     return pd.Timestamp(getattr(w, name))
 
 
+def _payload_X_as_dataframe(payload: Dict[str, Any]) -> pd.DataFrame:
+    if "X" not in payload:
+        raise ValueError("PCA currently supports tree payload with key 'X' only")
+    X = payload["X"]
+    if isinstance(X, pd.DataFrame):
+        return X.copy()
+    arr = np.asarray(X)
+    if arr.ndim != 2:
+        raise ValueError(f"PCA expects 2D X, got shape={arr.shape}")
+    cols = list(payload.get("feature_cols") or [f"f{i}" for i in range(arr.shape[1])])
+    return pd.DataFrame(arr, columns=cols)
+
+
+def _clone_payload_with_X(payload: Dict[str, Any], X_df: pd.DataFrame, feature_cols: List[str]) -> Dict[str, Any]:
+    out = dict(payload)
+    out["X"] = X_df
+    out["feature_cols"] = list(feature_cols)
+    return out
+
+
+def _fit_pca_state(train_payload: Dict[str, Any], pca_cfg: Dict[str, Any], *, prefix: str) -> Dict[str, Any]:
+    try:
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+    except Exception as e:
+        raise ImportError("pca.enabled=true requires scikit-learn") from e
+
+    X_train = _payload_X_as_dataframe(train_payload)
+    if X_train.shape[1] == 0:
+        raise ValueError("pca.enabled=true but feature dimension is 0")
+
+    standardize = bool(pca_cfg.get("standardize", True))
+    whiten = bool(pca_cfg.get("whiten", False))
+    svd_solver = str(pca_cfg.get("svd_solver", "auto"))
+    random_state = pca_cfg.get("random_state", None)
+
+    n_components = pca_cfg.get("n_components", None)
+    explained_ratio = pca_cfg.get("explained_variance_ratio", None)
+    if n_components is not None and explained_ratio is not None:
+        raise ValueError("pca config: set either n_components or explained_variance_ratio, not both")
+
+    if explained_ratio is not None:
+        n_comp = float(explained_ratio)
+        if not (0.0 < n_comp <= 1.0):
+            raise ValueError(f"pca.explained_variance_ratio must be in (0,1], got: {n_comp}")
+    elif n_components is not None:
+        n_comp = int(n_components)
+        if n_comp <= 0:
+            raise ValueError(f"pca.n_components must be > 0, got: {n_comp}")
+        n_comp = min(n_comp, int(X_train.shape[1]))
+    else:
+        # default keep 95% variance
+        n_comp = 0.95
+
+    scaler = None
+    X_fit = X_train
+    if standardize:
+        scaler = StandardScaler(with_mean=True, with_std=True)
+        X_fit = pd.DataFrame(
+            scaler.fit_transform(X_train),
+            columns=list(X_train.columns),
+            index=X_train.index,
+        )
+
+    pca = PCA(
+        n_components=n_comp,
+        whiten=whiten,
+        svd_solver=svd_solver,
+        random_state=random_state,
+    )
+    X_pc = pca.fit_transform(X_fit.to_numpy())
+    pc_cols = [f"{prefix}_{i:03d}" for i in range(X_pc.shape[1])]
+
+    return {
+        "scaler": scaler,
+        "pca": pca,
+        "pc_cols": pc_cols,
+        "n_input_features": int(X_train.shape[1]),
+        "n_output_features": int(X_pc.shape[1]),
+        "explained_variance_ratio_sum": float(np.sum(getattr(pca, "explained_variance_ratio_", np.array([])))),
+    }
+
+
+def _transform_payload_with_pca(payload: Dict[str, Any], pca_state: Dict[str, Any]) -> Dict[str, Any]:
+    X = _payload_X_as_dataframe(payload)
+    scaler = pca_state.get("scaler", None)
+    pca = pca_state["pca"]
+    pc_cols = list(pca_state["pc_cols"])
+
+    X_in = X.to_numpy()
+    if scaler is not None:
+        X_in = scaler.transform(X_in)
+    X_pc = pca.transform(X_in)
+    X_df = pd.DataFrame(X_pc, columns=pc_cols, index=X.index)
+    return _clone_payload_with_X(payload, X_df, pc_cols)
+
+
+def _build_pseudo_train_df(
+    df: pd.DataFrame,
+    *,
+    date_col: str,
+    label_col: str,
+    cfg: Dict[str, Any],
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if not bool((cfg or {}).get("enabled", False)):
+        return df, {"enabled": False, "n_in": int(len(df)), "n_out": int(len(df))}
+
+    y_source_col = str(cfg.get("y_source_col", f"{label_col}_raw"))
+    if y_source_col not in df.columns:
+        if bool(cfg.get("allow_fallback_to_label", True)) and label_col in df.columns:
+            logger.warning(
+                "pseudo_classification y_source_col missing, fallback to label_col | y_source_col=%s label_col=%s",
+                y_source_col,
+                label_col,
+            )
+            y_source_col = label_col
+        else:
+            raise KeyError(
+                f"pseudo_classification enabled but y_source_col '{y_source_col}' not in dataframe columns"
+            )
+
+    lower_q = float(cfg.get("lower_q", 0.30))
+    upper_q = float(cfg.get("upper_q", 0.70))
+    if not (0.0 < lower_q < upper_q < 1.0):
+        raise ValueError(f"pseudo_classification quantiles invalid: lower_q={lower_q}, upper_q={upper_q}")
+
+    low_label = float(cfg.get("low_label", -1.0))
+    high_label = float(cfg.get("high_label", 1.0))
+    scope = str(cfg.get("scope", "date")).lower()
+    if scope not in ("date", "global"):
+        raise ValueError(f"pseudo_classification.scope must be date|global, got: {scope}")
+
+    out = df.copy()
+    src = pd.to_numeric(out[y_source_col], errors="coerce")
+
+    if scope == "date":
+        lo = out.groupby(date_col, sort=False)[y_source_col].transform(lambda s: pd.to_numeric(s, errors="coerce").quantile(lower_q))
+        hi = out.groupby(date_col, sort=False)[y_source_col].transform(lambda s: pd.to_numeric(s, errors="coerce").quantile(upper_q))
+    else:
+        lo_v = float(src.quantile(lower_q))
+        hi_v = float(src.quantile(upper_q))
+        lo = pd.Series(lo_v, index=out.index)
+        hi = pd.Series(hi_v, index=out.index)
+
+    low_mask = src <= lo
+    high_mask = src >= hi
+    keep = (low_mask | high_mask) & src.notna()
+
+    fit_df = out.loc[keep].copy()
+    fit_df[label_col] = np.where(high_mask.loc[fit_df.index], high_label, low_label).astype(np.float32)
+
+    min_samples = int(cfg.get("min_samples", 10))
+    if len(fit_df) < min_samples:
+        raise ValueError(
+            f"pseudo_classification kept too few samples: {len(fit_df)} < min_samples={min_samples}"
+        )
+
+    n_low = int(low_mask.loc[fit_df.index].sum())
+    n_high = int(high_mask.loc[fit_df.index].sum())
+    if n_low == 0 or n_high == 0:
+        raise ValueError(
+            f"pseudo_classification one class empty after filtering: n_low={n_low}, n_high={n_high}"
+        )
+
+    st = {
+        "enabled": True,
+        "y_source_col": y_source_col,
+        "scope": scope,
+        "lower_q": lower_q,
+        "upper_q": upper_q,
+        "low_label": low_label,
+        "high_label": high_label,
+        "n_in": int(len(out)),
+        "n_out": int(len(fit_df)),
+        "n_low": int(n_low),
+        "n_high": int(n_high),
+    }
+    return fit_df, st
+
+
 @dataclass
 class RankICRefitRollParams:
     # factor selection
@@ -215,6 +396,9 @@ class RankICRefitRollTrainer:
         self.fs_cfg = dict(self.p.factor_selection or {})
         self.fs_enabled = bool(self.fs_cfg.get("enabled", False))
         self.sample_weighting_cfg = dict(params.get("sample_weighting", {}) or {})
+        self.pca_cfg = dict(params.get("pca", {}) or {})
+        self.pseudo_cls_cfg = dict(params.get("pseudo_classification", {}) or {})
+        self.optuna_cfg = dict(params.get("optuna", {}) or {})
         self._pred_map = None
         if self.fs_enabled:
             pkl_path = str(self.fs_cfg.get("predictions_pkl_path", ""))
@@ -283,6 +467,107 @@ class RankICRefitRollTrainer:
         payload, _ = datacut_long(part_df, cut_cfg, meta={"fold": fold, "part": part})
         return payload
 
+    def _should_run_optuna(
+        self,
+        *,
+        anchor_date: pd.Timestamp,
+        last_tune_date: Optional[pd.Timestamp],
+        cfg: Dict[str, Any],
+    ) -> bool:
+        if not bool(cfg.get("enabled", False)):
+            return False
+        if last_tune_date is None:
+            return bool(cfg.get("tune_first_window", True))
+        every_n_days = int(cfg.get("every_n_days", 5))
+        if every_n_days <= 0:
+            return False
+        return int((pd.Timestamp(anchor_date) - pd.Timestamp(last_tune_date)).days) >= every_n_days
+
+    def _suggest_optuna_params(self, trial: Any, search_space: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, spec in (search_space or {}).items():
+            name = str(k)
+            if isinstance(spec, dict):
+                typ = str(spec.get("type", "")).lower()
+                if typ == "float":
+                    out[name] = trial.suggest_float(
+                        name,
+                        float(spec["low"]),
+                        float(spec["high"]),
+                        log=bool(spec.get("log", False)),
+                        step=spec.get("step", None),
+                    )
+                elif typ == "int":
+                    out[name] = trial.suggest_int(
+                        name,
+                        int(spec["low"]),
+                        int(spec["high"]),
+                        step=int(spec.get("step", 1)),
+                        log=bool(spec.get("log", False)),
+                    )
+                elif typ == "categorical":
+                    out[name] = trial.suggest_categorical(name, list(spec.get("choices", [])))
+                else:
+                    raise ValueError(f"optuna.search_space[{name}] unknown type: {typ}")
+            elif isinstance(spec, list):
+                out[name] = trial.suggest_categorical(name, spec)
+            else:
+                raise ValueError(
+                    f"optuna.search_space[{name}] must be dict/list, got: {type(spec)}"
+                )
+        return out
+
+    def _run_optuna_search(
+        self,
+        *,
+        train_pl: Dict[str, Any],
+        test_pl: Dict[str, Any],
+        base_params: Dict[str, Any],
+        cfg: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        try:
+            import optuna
+        except Exception as e:
+            raise ImportError("optuna.enabled=true but optuna is not available") from e
+
+        search_space = dict(cfg.get("search_space", {}) or {})
+        if len(search_space) == 0:
+            raise ValueError("optuna.enabled=true requires non-empty optuna.search_space")
+
+        n_trials = int(cfg.get("n_trials", 20))
+        if n_trials <= 0:
+            raise ValueError(f"optuna.n_trials must be > 0, got: {n_trials}")
+
+        sampler_name = str(cfg.get("sampler", "tpe")).lower()
+        seed = int(cfg.get("seed", self.seed))
+        if sampler_name == "tpe":
+            sampler = optuna.samplers.TPESampler(seed=seed)
+        elif sampler_name == "random":
+            sampler = optuna.samplers.RandomSampler(seed=seed)
+        else:
+            raise ValueError(f"optuna.sampler must be tpe|random, got: {sampler_name}")
+
+        study = optuna.create_study(direction="maximize", sampler=sampler)
+
+        def objective(trial: Any) -> float:
+            delta = self._suggest_optuna_params(trial, search_space)
+            trial_params = copy.deepcopy(base_params)
+            trial_params.update(delta)
+            model, _ = self._helper._fit_one_window(train_pl, None, trial_params)
+            pred = self._helper._predict(model, test_pl)
+            score = float(self._helper._score(test_pl, pred))
+            return score
+
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        best_params = dict(study.best_params or {})
+        state = {
+            "enabled": True,
+            "n_trials": int(n_trials),
+            "best_value": float(study.best_value),
+            "best_params": dict(best_params),
+        }
+        return best_params, state
+
     def run(self, dates: Sequence[Any]) -> pd.DataFrame:
         """
         Run refit-roll strategy on a date index (unique sorted trading dates).
@@ -317,19 +602,35 @@ class RankICRefitRollTrainer:
             raise ValueError("rankic_refit_roll: candidate_pool is empty after preprocess schema filtering")
 
         selection_mode = str(self.fs_cfg.get("selection_mode", "historical_aggregate")).lower()
+        selection_scope = str(self.fs_cfg.get("selection_scope", "dual_stage")).lower()
         train_test_anchor = str(self.fs_cfg.get("train_test_anchor", "train_start"))
         future_anchor = str(self.fs_cfg.get("future_anchor", "future_start"))
         future_reselect = bool(self.fs_cfg.get("future_reselect", selection_mode == "single_day_threshold"))
+        future_single_set = selection_scope in {"future_only_single_set", "future_single_set", "future_only"}
+        if future_single_set:
+            future_reselect = True
+
+        pca_enabled = bool(self.pca_cfg.get("enabled", False))
+        pseudo_enabled = bool(self.pseudo_cls_cfg.get("enabled", False))
+        optuna_enabled = bool(self.optuna_cfg.get("enabled", False))
 
         logger.info(
-            "rankic_refit_roll run start | n_windows=%d | candidate_pool=%d | selection_mode=%s | train_test_anchor=%s | future_anchor=%s | future_reselect=%s",
+            "rankic_refit_roll run start | n_windows=%d | candidate_pool=%d | selection_mode=%s | selection_scope=%s | "
+            "train_test_anchor=%s | future_anchor=%s | future_reselect=%s | pca=%s | pseudo_cls=%s | optuna=%s",
             int(len(windows)),
             int(len(base_pool)),
             selection_mode,
+            selection_scope,
             train_test_anchor,
             future_anchor,
             bool(future_reselect),
+            bool(pca_enabled),
+            bool(pseudo_enabled),
+            bool(optuna_enabled),
         )
+
+        current_model_params = copy.deepcopy(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
+        last_optuna_date: Optional[pd.Timestamp] = None
 
         for w in windows:
             fold = int(w.window_id)
@@ -359,64 +660,119 @@ class RankICRefitRollTrainer:
                     return fb, state, None
                 return [], state, f"{tag}_empty_selected_factors"
 
-            train_select_date = _resolve_window_anchor_date(w, train_test_anchor, default="train_start")
-            train_selected_raw, fs_train_state = self._select_factor_set(select_date=train_select_date, candidate_pool=base_pool)
-            train_factors, fs_train_state, skip_reason = _normalize_selection(train_selected_raw, fs_train_state, tag="train_test")
-            if skip_reason is not None:
-                records.append(
-                    {
-                        **rec_base,
-                        "n_selected_factors": 0,
-                        "n_selected_factors_train_test": 0,
-                        "n_selected_factors_future": 0,
-                        "factor_selection": dict(fs_train_state or {}),
-                        "factor_selection_train_test": dict(fs_train_state or {}),
-                        "factor_selection_future": None,
-                        "test_score": np.nan,
-                        "future_score": np.nan,
-                        "saved_train": None,
-                        "saved_test": None,
-                        "saved_future": None,
-                        "skipped": True,
-                        "skip_reason": skip_reason,
-                    }
-                )
-                logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
-                continue
-
             future_select_date = _resolve_window_anchor_date(w, future_anchor, default="future_start")
-            if future_reselect:
-                future_selected_raw, fs_future_state = self._select_factor_set(select_date=future_select_date, candidate_pool=base_pool)
-            else:
-                future_selected_raw = list(train_factors)
-                fs_future_state = {
-                    "enabled": bool(self.fs_enabled),
-                    "selection_mode": "inherit_train_test",
-                    "select_date": str(future_select_date)[:10],
-                    "n_selected": int(len(future_selected_raw)),
-                }
-            future_factors, fs_future_state, skip_reason = _normalize_selection(future_selected_raw, fs_future_state, tag="future")
-            if skip_reason is not None:
-                records.append(
-                    {
-                        **rec_base,
-                        "n_selected_factors": int(len(train_factors)),
-                        "n_selected_factors_train_test": int(len(train_factors)),
-                        "n_selected_factors_future": 0,
-                        "factor_selection": dict(fs_train_state or {}),
-                        "factor_selection_train_test": dict(fs_train_state or {}),
-                        "factor_selection_future": dict(fs_future_state or {}),
-                        "test_score": np.nan,
-                        "future_score": np.nan,
-                        "saved_train": None,
-                        "saved_test": None,
-                        "saved_future": None,
-                        "skipped": True,
-                        "skip_reason": skip_reason,
-                    }
+            train_select_date = _resolve_window_anchor_date(w, train_test_anchor, default="train_start")
+
+            fs_train_state: Dict[str, Any]
+            fs_future_state: Dict[str, Any]
+            if future_single_set:
+                selected_raw, fs_shared_state = self._select_factor_set(
+                    select_date=future_select_date,
+                    candidate_pool=base_pool,
                 )
-                logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
-                continue
+                shared_factors, fs_shared_state, skip_reason = _normalize_selection(
+                    selected_raw, fs_shared_state, tag="future_shared"
+                )
+                if skip_reason is not None:
+                    records.append(
+                        {
+                            **rec_base,
+                            "n_selected_factors": 0,
+                            "n_selected_factors_train_test": 0,
+                            "n_selected_factors_future": 0,
+                            "factor_selection": dict(fs_shared_state or {}),
+                            "factor_selection_train_test": dict(fs_shared_state or {}),
+                            "factor_selection_future": dict(fs_shared_state or {}),
+                            "train_score": np.nan,
+                            "test_score": np.nan,
+                            "future_score": np.nan,
+                            "saved_train": None,
+                            "saved_test": None,
+                            "saved_future": None,
+                            "skipped": True,
+                            "skip_reason": skip_reason,
+                        }
+                    )
+                    logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
+                    continue
+
+                fs_shared_state = dict(fs_shared_state or {})
+                fs_shared_state["selection_scope"] = "future_only_single_set"
+                fs_shared_state["select_date_train_test"] = str(future_select_date)[:10]
+                fs_shared_state["select_date_future"] = str(future_select_date)[:10]
+                train_factors = list(shared_factors)
+                future_factors = list(shared_factors)
+                fs_train_state = dict(fs_shared_state)
+                fs_future_state = dict(fs_shared_state)
+            else:
+                train_selected_raw, fs_train_state = self._select_factor_set(
+                    select_date=train_select_date,
+                    candidate_pool=base_pool,
+                )
+                train_factors, fs_train_state, skip_reason = _normalize_selection(
+                    train_selected_raw, fs_train_state, tag="train_test"
+                )
+                if skip_reason is not None:
+                    records.append(
+                        {
+                            **rec_base,
+                            "n_selected_factors": 0,
+                            "n_selected_factors_train_test": 0,
+                            "n_selected_factors_future": 0,
+                            "factor_selection": dict(fs_train_state or {}),
+                            "factor_selection_train_test": dict(fs_train_state or {}),
+                            "factor_selection_future": None,
+                            "train_score": np.nan,
+                            "test_score": np.nan,
+                            "future_score": np.nan,
+                            "saved_train": None,
+                            "saved_test": None,
+                            "saved_future": None,
+                            "skipped": True,
+                            "skip_reason": skip_reason,
+                        }
+                    )
+                    logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
+                    continue
+
+                if future_reselect:
+                    future_selected_raw, fs_future_state = self._select_factor_set(
+                        select_date=future_select_date,
+                        candidate_pool=base_pool,
+                    )
+                else:
+                    future_selected_raw = list(train_factors)
+                    fs_future_state = {
+                        "enabled": bool(self.fs_enabled),
+                        "selection_mode": "inherit_train_test",
+                        "select_date": str(future_select_date)[:10],
+                        "n_selected": int(len(future_selected_raw)),
+                    }
+                future_factors, fs_future_state, skip_reason = _normalize_selection(
+                    future_selected_raw, fs_future_state, tag="future"
+                )
+                if skip_reason is not None:
+                    records.append(
+                        {
+                            **rec_base,
+                            "n_selected_factors": int(len(train_factors)),
+                            "n_selected_factors_train_test": int(len(train_factors)),
+                            "n_selected_factors_future": 0,
+                            "factor_selection": dict(fs_train_state or {}),
+                            "factor_selection_train_test": dict(fs_train_state or {}),
+                            "factor_selection_future": dict(fs_future_state or {}),
+                            "train_score": np.nan,
+                            "test_score": np.nan,
+                            "future_score": np.nan,
+                            "saved_train": None,
+                            "saved_test": None,
+                            "saved_future": None,
+                            "skipped": True,
+                            "skip_reason": skip_reason,
+                        }
+                    )
+                    logger.warning("window skipped | id=%d | reason=%s", fold, skip_reason)
+                    continue
 
             key_cols = [self.date_col, self.stockid_col, self.label_col]
             train_cols = list(dict.fromkeys(key_cols + list(train_factors)))
@@ -459,6 +815,7 @@ class RankICRefitRollTrainer:
                         "factor_selection": dict(fs_train_state or {}),
                         "factor_selection_train_test": dict(fs_train_state or {}),
                         "factor_selection_future": dict(fs_future_state or {}),
+                        "train_score": np.nan,
                         "test_score": np.nan,
                         "future_score": np.nan,
                         "saved_train": None,
@@ -477,13 +834,24 @@ class RankICRefitRollTrainer:
                 )
                 continue
 
-            # train/test use train_factors
+            # train/test full-market payloads for scoring
             train_pl = self._cut_part(df_train, feature_cols=train_factors, fold=fold, part="train")
             test_pl = self._cut_part(df_test, feature_cols=train_factors, fold=fold, part="test")
+            train_fit_pl = train_pl
+            pseudo_train_state: Dict[str, Any] = {"enabled": False}
+            if pseudo_enabled:
+                df_train_fit, pseudo_train_state = _build_pseudo_train_df(
+                    df_train,
+                    date_col=self.date_col,
+                    label_col=self.label_col,
+                    cfg=self.pseudo_cls_cfg,
+                )
+                train_fit_pl = self._cut_part(df_train_fit, feature_cols=train_factors, fold=fold, part="train_fit")
 
             if (
                 self._helper._is_empty_payload(train_pl)
                 or self._helper._is_empty_payload(test_pl)
+                or self._helper._is_empty_payload(train_fit_pl)
             ):
                 records.append(
                     {
@@ -494,6 +862,7 @@ class RankICRefitRollTrainer:
                         "factor_selection": dict(fs_train_state or {}),
                         "factor_selection_train_test": dict(fs_train_state or {}),
                         "factor_selection_future": dict(fs_future_state or {}),
+                        "train_score": np.nan,
                         "test_score": np.nan,
                         "future_score": np.nan,
                         "saved_train": None,
@@ -505,6 +874,25 @@ class RankICRefitRollTrainer:
                 )
                 logger.warning("window skipped | id=%d | reason=empty_train_test_payload_after_cut", fold)
                 continue
+
+            # optional PCA for eval stage: fit on train_fit_pl, apply to train_fit/train/test payloads
+            pca_eval_state: Dict[str, Any] = {"enabled": False}
+            train_fit_pl_model = train_fit_pl
+            train_pl_model = train_pl
+            test_pl_model = test_pl
+            if pca_enabled:
+                pca_eval_state = _fit_pca_state(train_fit_pl, self.pca_cfg, prefix=f"pc_eval_w{fold:04d}")
+                logger.info(
+                    "pca eval fitted | window_id=%d | n_input_features=%d | n_output_features=%d | explained_variance_ratio_sum=%.6f",
+                    fold,
+                    int(pca_eval_state.get("n_input_features", 0)),
+                    int(pca_eval_state.get("n_output_features", 0)),
+                    float(pca_eval_state.get("explained_variance_ratio_sum", np.nan)),
+                )
+                train_fit_pl_model = _transform_payload_with_pca(train_fit_pl, pca_eval_state)
+                train_pl_model = _transform_payload_with_pca(train_pl, pca_eval_state)
+                test_pl_model = _transform_payload_with_pca(test_pl, pca_eval_state)
+                pca_eval_state = dict({"enabled": True}, **pca_eval_state)
 
             meta = {
                 "run_id": self.run_id,
@@ -519,54 +907,83 @@ class RankICRefitRollTrainer:
                 "test_end": str(w.test_end)[:10],
                 "future_start": str(w.future_start)[:10],
                 "future_end": str(w.future_end)[:10],
+                "selection_scope": selection_scope,
             }
 
+            tune_state: Dict[str, Any] = {"enabled": False, "tuned": False}
+            optuna_anchor = str(self.optuna_cfg.get("anchor", "future_start"))
+            tune_anchor_date = _resolve_window_anchor_date(w, optuna_anchor, default="future_start")
+            if self._should_run_optuna(
+                anchor_date=tune_anchor_date,
+                last_tune_date=last_optuna_date,
+                cfg=self.optuna_cfg,
+            ):
+                best_delta, tune_state = self._run_optuna_search(
+                    train_pl=train_fit_pl_model,
+                    test_pl=test_pl_model,
+                    base_params=current_model_params,
+                    cfg=self.optuna_cfg,
+                )
+                if best_delta:
+                    current_model_params.update(best_delta)
+                    tune_state["updated"] = True
+                else:
+                    tune_state["updated"] = False
+                tune_state["enabled"] = True
+                tune_state["tuned"] = True
+                tune_state["anchor_date"] = str(pd.Timestamp(tune_anchor_date).date())
+                last_optuna_date = pd.Timestamp(tune_anchor_date)
+
             # ---- 2) eval model: train -> test evaluation ----
-            eval_model, _ = self._helper._fit_one_window(train_pl, None, self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
-            train_pred = self._helper._predict(eval_model, train_pl)
-            test_pred = self._helper._predict(eval_model, test_pl)
-            test_score = float(self._helper._score(test_pl, test_pred))
+            eval_model, _ = self._helper._fit_one_window(train_fit_pl_model, None, current_model_params)
+            train_pred = self._helper._predict(eval_model, train_pl_model)
+            test_pred = self._helper._predict(eval_model, test_pl_model)
+            train_score = float(self._helper._score(train_pl_model, train_pred))
+            test_score = float(self._helper._score(test_pl_model, test_pred))
 
             saved_train = None
             if self.save_enabled and self.saver is not None:
                 saved_train = self._helper._save_preds(
-                    train_pl,
+                    train_pl_model,
                     train_pred,
                     meta,
                     part="train",
-                    params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})),
+                    params=current_model_params,
                 )
 
             saved_test = None
             if self.save_enabled and self.saver is not None:
-                saved_test = self._helper._save_preds(test_pl, test_pred, meta, part="test", params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})))
+                saved_test = self._helper._save_preds(
+                    test_pl_model, test_pred, meta, part="test", params=current_model_params
+                )
 
             del train_pred, test_pred
             gc.collect()
 
             # ---- 3) refit final model on train+test (future factor set) ----
             # If future factor set differs, re-read train/test with future columns only.
-            if list(train_factors) == list(future_factors):
+            if list(train_factors) == list(future_factors) and not pseudo_enabled:
                 refit_pl = _combine_payloads(train_pl, test_pl)
             else:
                 # release eval-stage heavy objects before refit-stage read
-                del train_pl, test_pl, df_train, df_test
-                gc.collect()
-
-                df_train_refit = _read_part_from_preprocess(
-                    self.preprocess_path,
-                    date_col=self.date_col,
-                    start_date=w.train_start,
-                    end_date=w.train_end,
-                    columns=future_cols,
-                )
-                df_test_refit = _read_part_from_preprocess(
-                    self.preprocess_path,
-                    date_col=self.date_col,
-                    start_date=w.test_start,
-                    end_date=w.test_end,
-                    columns=future_cols,
-                )
+                if list(train_factors) == list(future_factors):
+                    df_train_refit = df_train
+                    df_test_refit = df_test
+                else:
+                    df_train_refit = _read_part_from_preprocess(
+                        self.preprocess_path,
+                        date_col=self.date_col,
+                        start_date=w.train_start,
+                        end_date=w.train_end,
+                        columns=future_cols,
+                    )
+                    df_test_refit = _read_part_from_preprocess(
+                        self.preprocess_path,
+                        date_col=self.date_col,
+                        start_date=w.test_start,
+                        end_date=w.test_end,
+                        columns=future_cols,
+                    )
                 if df_train_refit.empty or df_test_refit.empty:
                     records.append(
                         {
@@ -577,6 +994,7 @@ class RankICRefitRollTrainer:
                             "factor_selection": dict(fs_train_state or {}),
                             "factor_selection_train_test": dict(fs_train_state or {}),
                             "factor_selection_future": dict(fs_future_state or {}),
+                            "train_score": float(train_score),
                             "test_score": float(test_score),
                             "future_score": np.nan,
                             "saved_train": saved_train,
@@ -592,9 +1010,25 @@ class RankICRefitRollTrainer:
                     logger.warning("window skipped | id=%d | reason=empty_refit_train_test_part", fold)
                     continue
 
-                refit_train_pl = self._cut_part(df_train_refit, feature_cols=future_factors, fold=fold, part="train_refit")
-                refit_test_pl = self._cut_part(df_test_refit, feature_cols=future_factors, fold=fold, part="test_refit")
-                if self._helper._is_empty_payload(refit_train_pl) or self._helper._is_empty_payload(refit_test_pl):
+                if pseudo_enabled:
+                    df_refit_all = pd.concat([df_train_refit, df_test_refit], axis=0, ignore_index=True)
+                    df_refit_fit, pseudo_refit_state = _build_pseudo_train_df(
+                        df_refit_all,
+                        date_col=self.date_col,
+                        label_col=self.label_col,
+                        cfg=self.pseudo_cls_cfg,
+                    )
+                    refit_pl = self._cut_part(df_refit_fit, feature_cols=future_factors, fold=fold, part="refit_fit")
+                else:
+                    refit_train_pl = self._cut_part(
+                        df_train_refit, feature_cols=future_factors, fold=fold, part="train_refit"
+                    )
+                    refit_test_pl = self._cut_part(
+                        df_test_refit, feature_cols=future_factors, fold=fold, part="test_refit"
+                    )
+                    refit_pl = _combine_payloads(refit_train_pl, refit_test_pl)
+
+                if self._helper._is_empty_payload(refit_pl):
                     records.append(
                         {
                             **rec_base,
@@ -604,6 +1038,7 @@ class RankICRefitRollTrainer:
                             "factor_selection": dict(fs_train_state or {}),
                             "factor_selection_train_test": dict(fs_train_state or {}),
                             "factor_selection_future": dict(fs_future_state or {}),
+                            "train_score": float(train_score),
                             "test_score": float(test_score),
                             "future_score": np.nan,
                             "saved_train": saved_train,
@@ -616,16 +1051,9 @@ class RankICRefitRollTrainer:
                     logger.warning("window skipped | id=%d | reason=empty_refit_payload_after_cut", fold)
                     continue
 
-                refit_pl = _combine_payloads(refit_train_pl, refit_test_pl)
-                del refit_train_pl, refit_test_pl, df_train_refit, df_test_refit
-
-            final_model, _ = self._helper._fit_one_window(refit_pl, None, self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {}))
-            del refit_pl
-            train_pl = None
-            test_pl = None
-            df_train = None
-            df_test = None
-            gc.collect()
+            # Optional PCA for final refit/future stage
+            pca_final_state: Dict[str, Any] = {"enabled": False}
+            refit_pl_model = refit_pl
 
             # ---- 4) future prediction (separate from test eval) ----
             df_future = _read_part_from_preprocess(
@@ -645,6 +1073,7 @@ class RankICRefitRollTrainer:
                         "factor_selection": dict(fs_train_state or {}),
                         "factor_selection_train_test": dict(fs_train_state or {}),
                         "factor_selection_future": dict(fs_future_state or {}),
+                        "train_score": float(train_score),
                         "test_score": float(test_score),
                         "future_score": np.nan,
                         "saved_train": saved_train,
@@ -671,6 +1100,7 @@ class RankICRefitRollTrainer:
                         "factor_selection": dict(fs_train_state or {}),
                         "factor_selection_train_test": dict(fs_train_state or {}),
                         "factor_selection_future": dict(fs_future_state or {}),
+                        "train_score": float(train_score),
                         "test_score": float(test_score),
                         "future_score": np.nan,
                         "saved_train": saved_train,
@@ -683,12 +1113,34 @@ class RankICRefitRollTrainer:
                 logger.warning("window skipped | id=%d | reason=empty_future_payload_after_cut", fold)
                 continue
 
-            future_pred = self._helper._predict(final_model, future_pl)
+            if pca_enabled:
+                pca_final_state = _fit_pca_state(refit_pl, self.pca_cfg, prefix=f"pc_final_w{fold:04d}")
+                logger.info(
+                    "pca final fitted | window_id=%d | n_input_features=%d | n_output_features=%d | explained_variance_ratio_sum=%.6f",
+                    fold,
+                    int(pca_final_state.get("n_input_features", 0)),
+                    int(pca_final_state.get("n_output_features", 0)),
+                    float(pca_final_state.get("explained_variance_ratio_sum", np.nan)),
+                )
+                refit_pl_model = _transform_payload_with_pca(refit_pl, pca_final_state)
+                future_pl_model = _transform_payload_with_pca(future_pl, pca_final_state)
+                pca_final_state = dict({"enabled": True}, **pca_final_state)
+            else:
+                future_pl_model = future_pl
+
+            final_model, _ = self._helper._fit_one_window(refit_pl_model, None, current_model_params)
+            future_pred = self._helper._predict(final_model, future_pl_model)
             future_score = float(self._helper._score(future_pl, future_pred))
 
             saved_future = None
             if self.save_enabled and self.saver is not None:
-                saved_future = self._helper._save_preds(future_pl, future_pred, meta, part="future", params=(self.model_cfg.get("model_config", {}) or self.model_cfg.get("params", {})))
+                saved_future = self._helper._save_preds(
+                    future_pl_model,
+                    future_pred,
+                    meta,
+                    part="future",
+                    params=current_model_params,
+                )
 
             # save selected factor set artifact (per window)
             sf_path_train = str(Path(factors_dir) / f"selected_factors_window_{fold:04d}.json")
@@ -705,23 +1157,38 @@ class RankICRefitRollTrainer:
                     "factor_selection": fs_train_state,
                     "factor_selection_train_test": fs_train_state,
                     "factor_selection_future": fs_future_state,
+                    "train_score": float(train_score),
                     "test_score": float(test_score),
                     "future_score": float(future_score),
                     "saved_train": saved_train,
                     "saved_test": saved_test,
                     "saved_future": saved_future,
+                    "selection_scope": selection_scope,
+                    "model_params": dict(current_model_params),
+                    "tune_state": dict(tune_state),
+                    "pseudo_state_train": dict(pseudo_train_state),
+                    "pca_state_eval": dict(pca_eval_state),
+                    "pca_state_final": dict(pca_final_state),
                     "skipped": False,
                 }
             )
 
             logger.info(
-                "window done | id=%d | n_factors_train_test=%d | n_factors_future=%d | test_score=%.6f | future_score=%.6f",
+                "window done | id=%d | n_factors_train_test=%d | n_factors_future=%d | train_score=%.6f | test_score=%.6f | future_score=%.6f",
                 fold,
                 int(len(train_factors)),
                 int(len(future_factors)),
+                float(train_score),
                 float(test_score),
                 float(future_score),
             )
+
+            # explicit per-window cleanup
+            try:
+                del eval_model, final_model, train_pl, test_pl, train_fit_pl, refit_pl, future_pl
+            except Exception:
+                pass
+            gc.collect()
 
         hist_df = pd.DataFrame(records)
         logger.info("rankic_refit_roll run end | n_windows=%d", int(len(hist_df)))

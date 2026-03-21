@@ -205,8 +205,9 @@ class SweepRankICRefitRollTrainer:
             )
 
             logger.info(
-                "sweep_rankic param done | %s | mean_test=%.6f | mean_future=%.6f",
+                "sweep_rankic param done | %s | mean_train=%.6f | mean_test=%.6f | mean_future=%.6f",
                 sweep_id,
+                float(row.get("mean_train_score", np.nan)),
                 float(row.get("mean_test_score", np.nan)),
                 float(row.get("mean_future_score", np.nan)),
             )
@@ -316,8 +317,10 @@ class SweepRankICRefitRollTrainer:
             return float(s.values[-1])
 
         out["n_windows"] = int(len(hist_df))
+        out["mean_train_score"] = _mean_col("train_score")
         out["mean_test_score"] = _mean_col("test_score")
         out["mean_future_score"] = _mean_col("future_score")
+        out["last_train_score"] = _last_col("train_score")
         out["last_test_score"] = _last_col("test_score")
         out["last_future_score"] = _last_col("future_score")
         return out
