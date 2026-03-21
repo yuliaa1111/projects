@@ -438,7 +438,14 @@ class RankICRefitRollTrainer:
             bool(self.fs_enabled),
         )
 
-    def _select_factor_set(self, *, select_date: pd.Timestamp, candidate_pool: List[str]) -> Tuple[List[str], Dict[str, Any]]:
+    def _select_factor_set(
+        self,
+        *,
+        select_date: pd.Timestamp,
+        candidate_pool: List[str],
+        min_selected: int = 0,
+        min_selected_mode: str = "none",
+    ) -> Tuple[List[str], Dict[str, Any]]:
         if not self.fs_enabled or self._pred_map is None:
             return list(candidate_pool), {"enabled": False, "select_date": str(select_date)[:10], "n_selected": int(len(candidate_pool))}
 
@@ -452,6 +459,8 @@ class RankICRefitRollTrainer:
             min_history_days=int(self.fs_cfg.get("min_history_days", 1)),
             candidate_pool=candidate_pool,
             selection_mode=selection_mode,
+            min_selected=int(min_selected),
+            min_selected_mode=str(min_selected_mode),
         )
         return selected, {"enabled": True, **state}
 
@@ -609,6 +618,8 @@ class RankICRefitRollTrainer:
         future_single_set = selection_scope in {"future_only_single_set", "future_single_set", "future_only"}
         if future_single_set:
             future_reselect = True
+        future_min_selected = int(self.fs_cfg.get("future_min_selected", 0))
+        future_min_selected_mode = str(self.fs_cfg.get("future_min_selected_mode", "none"))
 
         pca_enabled = bool(self.pca_cfg.get("enabled", False))
         pseudo_enabled = bool(self.pseudo_cls_cfg.get("enabled", False))
@@ -616,7 +627,8 @@ class RankICRefitRollTrainer:
 
         logger.info(
             "rankic_refit_roll run start | n_windows=%d | candidate_pool=%d | selection_mode=%s | selection_scope=%s | "
-            "train_test_anchor=%s | future_anchor=%s | future_reselect=%s | pca=%s | pseudo_cls=%s | optuna=%s",
+            "train_test_anchor=%s | future_anchor=%s | future_reselect=%s | future_min_selected=%d | "
+            "future_min_selected_mode=%s | pca=%s | pseudo_cls=%s | optuna=%s",
             int(len(windows)),
             int(len(base_pool)),
             selection_mode,
@@ -624,6 +636,8 @@ class RankICRefitRollTrainer:
             train_test_anchor,
             future_anchor,
             bool(future_reselect),
+            int(future_min_selected),
+            str(future_min_selected_mode),
             bool(pca_enabled),
             bool(pseudo_enabled),
             bool(optuna_enabled),
@@ -669,6 +683,8 @@ class RankICRefitRollTrainer:
                 selected_raw, fs_shared_state = self._select_factor_set(
                     select_date=future_select_date,
                     candidate_pool=base_pool,
+                    min_selected=future_min_selected,
+                    min_selected_mode=future_min_selected_mode,
                 )
                 shared_factors, fs_shared_state, skip_reason = _normalize_selection(
                     selected_raw, fs_shared_state, tag="future_shared"
@@ -739,6 +755,8 @@ class RankICRefitRollTrainer:
                     future_selected_raw, fs_future_state = self._select_factor_set(
                         select_date=future_select_date,
                         candidate_pool=base_pool,
+                        min_selected=future_min_selected,
+                        min_selected_mode=future_min_selected_mode,
                     )
                 else:
                     future_selected_raw = list(train_factors)

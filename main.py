@@ -475,6 +475,11 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                 asof_dates = [w.factor_selection_asof_date for w in windows]
 
                         total_asof_dates += int(len(asof_dates))
+                        preplan_min_selected = 0
+                        preplan_min_selected_mode = "none"
+                        if selection_mode == "single_day_threshold" and future_single_set:
+                            preplan_min_selected = int(fs_i.get("future_min_selected", 0))
+                            preplan_min_selected_mode = str(fs_i.get("future_min_selected_mode", "none"))
 
                         pool_i, state_i = select_union_factors_by_rankic(
                             pred_map,
@@ -485,6 +490,8 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                             min_history_days=int(fs_i.get("min_history_days", 1)),
                             candidate_pool=base_pool,
                             selection_mode=selection_mode,
+                            min_selected=int(preplan_min_selected),
+                            min_selected_mode=str(preplan_min_selected_mode),
                         )
                         for f in pool_i:
                             if f not in union_seen:
@@ -501,6 +508,8 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                 "future_anchor": future_anchor,
                                 "future_reselect": bool(future_reselect),
                                 "future_single_set": bool(future_single_set),
+                                "future_min_selected": int(preplan_min_selected),
+                                "future_min_selected_mode": str(preplan_min_selected_mode),
                                 "n_asof_dates": int(len(asof_dates)),
                                 "n_union": int(len(pool_i)),
                                 "state": state_i,

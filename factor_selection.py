@@ -155,6 +155,8 @@ def select_factors_by_rankic(
     min_history_days: int = 1,
     candidate_pool: Optional[Iterable[str]] = None,
     selection_mode: str = "historical_aggregate",
+    min_selected: int = 0,
+    min_selected_mode: str = "none",
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Select factors based on historical RankIC up to `asof_date`.
@@ -170,6 +172,8 @@ def select_factors_by_rankic(
             select_date=asof_date,
             threshold=threshold,
             candidate_pool=candidate_pool,
+            min_selected=min_selected,
+            min_selected_mode=min_selected_mode,
         )
     if selection_mode != "historical_aggregate":
         raise ValueError(f"unknown selection_mode: {selection_mode}")
@@ -219,6 +223,8 @@ def select_factors_by_day_rankic(
     select_date: str | pd.Timestamp,
     threshold: float = 0.03,
     candidate_pool: Optional[Iterable[str]] = None,
+    min_selected: int = 0,
+    min_selected_mode: str = "none",
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Select factors by rankic snapshot of one day:
@@ -228,6 +234,15 @@ def select_factors_by_day_rankic(
         df = to_rankic_frame(pred_map_or_df)
     else:
         df = pred_map_or_df.copy()
+
+    min_selected = int(min_selected)
+    if min_selected < 0:
+        raise ValueError(f"min_selected must be >= 0, got: {min_selected}")
+    min_selected_mode = str(min_selected_mode or "none").lower()
+    if min_selected_mode not in ("none", "topk_on_day_abs_rankic"):
+        raise ValueError(
+            f"min_selected_mode must be none|topk_on_day_abs_rankic, got: {min_selected_mode}"
+        )
 
     if df.empty:
         return [], {"selection_mode": "single_day_threshold", "select_date": str(select_date), "n_day_rows": 0, "selected": []}
@@ -256,11 +271,28 @@ def select_factors_by_day_rankic(
     picked = picked.sort_values("abs_rankic", ascending=False)
 
     selected = picked["factor"].astype(str).drop_duplicates().tolist()
+    n_selected_before_min = int(len(selected))
+    min_selected_applied = False
+    if min_selected > 0 and n_selected_before_min < min_selected and min_selected_mode == "topk_on_day_abs_rankic":
+        topk = (
+            day.sort_values("abs_rankic", ascending=False)["factor"]
+            .astype(str)
+            .drop_duplicates()
+            .head(min_selected)
+            .tolist()
+        )
+        selected = list(topk)
+        min_selected_applied = True
+
     state: Dict[str, Any] = {
         "selection_mode": "single_day_threshold",
         "select_date": str(d.date()),
         "threshold": float(threshold),
+        "min_selected": int(min_selected),
+        "min_selected_mode": str(min_selected_mode),
+        "min_selected_applied": bool(min_selected_applied),
         "n_day_rows": int(len(day)),
+        "n_selected_before_min": int(n_selected_before_min),
         "n_selected": int(len(selected)),
         "selected": list(selected),
     }
@@ -277,6 +309,8 @@ def select_union_factors_by_rankic(
     min_history_days: int = 1,
     candidate_pool: Optional[Iterable[str]] = None,
     selection_mode: str = "historical_aggregate",
+    min_selected: int = 0,
+    min_selected_mode: str = "none",
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Build a union factor pool across multiple refit asof dates.
@@ -304,6 +338,8 @@ def select_union_factors_by_rankic(
             min_history_days=min_history_days,
             candidate_pool=pool_list,
             selection_mode=selection_mode,
+            min_selected=min_selected,
+            min_selected_mode=min_selected_mode,
         )
         for f in selected:
             if f not in seen:
@@ -313,6 +349,8 @@ def select_union_factors_by_rankic(
 
     state: Dict[str, Any] = {
         "selection_mode": str(selection_mode),
+        "min_selected": int(min_selected),
+        "min_selected_mode": str(min_selected_mode),
         "n_asof_dates": int(len(dates)),
         "asof_start": str(pd.Timestamp(dates[0]).date()),
         "asof_end": str(pd.Timestamp(dates[-1]).date()),
