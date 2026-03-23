@@ -257,3 +257,5 @@ evaluate:
         save_figures: true
         return_data: false
         verbose: true
+        enable_turnover_fee: true
+        turnover_fee_rate: 0.00045

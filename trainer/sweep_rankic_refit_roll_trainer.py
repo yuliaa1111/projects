@@ -7,6 +7,7 @@ Sweep trainer for rankic_refit_roll strategy.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import copy
@@ -45,11 +46,39 @@ def _deep_merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str
 
 def _jsonify_parquet_unsafe_cols(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert nested object columns (dict/list/tuple) to JSON strings so pyarrow parquet
-    does not fail on empty struct/map inference.
+    Convert object columns to parquet-safe values:
+    - dict/list/tuple -> JSON string
+    - non-primitive Python objects (e.g. sklearn estimators) -> string
     """
     def _is_missing(x: Any) -> bool:
         return x is None or (isinstance(x, (float, np.floating)) and np.isnan(x))
+
+    def _is_primitive(x: Any) -> bool:
+        return isinstance(
+            x,
+            (
+                str,
+                bytes,
+                bool,
+                int,
+                float,
+                np.integer,
+                np.floating,
+                np.bool_,
+                pd.Timestamp,
+                datetime,
+                date,
+            ),
+        )
+
+    def _coerce(x: Any) -> Any:
+        if _is_missing(x):
+            return None
+        if isinstance(x, (dict, list, tuple)):
+            return json.dumps(x, ensure_ascii=False, default=str)
+        if _is_primitive(x):
+            return x
+        return str(x)
 
     out = df.copy()
     for c in out.columns:
@@ -59,10 +88,12 @@ def _jsonify_parquet_unsafe_cols(df: pd.DataFrame) -> pd.DataFrame:
         non_na = [x for x in s.tolist() if not _is_missing(x)]
         if len(non_na) == 0:
             continue
-        if any(isinstance(x, (dict, list, tuple)) for x in non_na):
-            out[c] = s.apply(
-                lambda x: None if _is_missing(x) else json.dumps(x, ensure_ascii=False, default=str)
-            )
+        need_coerce = any(
+            isinstance(x, (dict, list, tuple)) or (not _is_primitive(x))
+            for x in non_na
+        )
+        if need_coerce:
+            out[c] = s.apply(_coerce)
     return out
 
 
@@ -171,6 +202,7 @@ class SweepRankICRefitRollTrainer:
             )
 
             hist_df = trainer.run(dates)
+            hist_df = _jsonify_parquet_unsafe_cols(hist_df)
             hist_path = one_dir / "train_history.parquet"
             hist_df.to_parquet(hist_path, index=False)
 

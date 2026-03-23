@@ -298,8 +298,8 @@ evaluate:
         return_data: true
         verbose: true
         eval_price: "open"
-        # enable_turnover_fee: true
-        # turnover_fee_rate: 0.00045
+        enable_turnover_fee: true
+        turnover_fee_rate: 0.00045
 
 # 新增：rankic_refit_roll 多参数组一次训练（可选）
 # 使用时：把 trainer.name 改为 "sweep_rankic_refit_roll"

@@ -31,6 +31,12 @@ def _build_recency_weights(
     if keys is None or date_col not in keys.columns:
         logger.warning("sample_weighting.recency enabled but keys/date_col missing; fallback to ones")
         return _ones(n)
+    if len(keys) != n:
+        logger.warning(
+            "sample_weighting.recency keys length mismatch | n_y=%d n_keys=%d | fallback to ones",
+            int(n), int(len(keys)),
+        )
+        return _ones(n)
 
     d = pd.to_datetime(keys[date_col], errors="coerce")
     if d.notna().sum() == 0:
@@ -106,10 +112,20 @@ def _build_tail_weights(
         if keys is None or date_col not in keys.columns:
             logger.warning("sample_weighting.tail_y scope=date but keys/date_col missing; fallback to global")
             return _build_tail_weights(y=y, keys=None, date_col=date_col, cfg={**cfg, "scope": "global"})
+        if len(keys) != n:
+            logger.warning(
+                "sample_weighting.tail_y scope=date keys length mismatch | n_y=%d n_keys=%d | fallback to global",
+                int(n), int(len(keys)),
+            )
+            return _build_tail_weights(y=y, keys=None, date_col=date_col, cfg={**cfg, "scope": "global"})
+
+        # Build by positional arrays to avoid pandas index alignment expanding rows.
+        yv = pd.to_numeric(pd.Series(y), errors="coerce").to_numpy()
+        dv = pd.to_datetime(keys[date_col], errors="coerce").to_numpy()
         tmp = pd.DataFrame(
             {
-                "__y": pd.to_numeric(pd.Series(y), errors="coerce"),
-                "__d": pd.to_datetime(keys[date_col], errors="coerce"),
+                "__y": yv,
+                "__d": dv,
             }
         )
         g = tmp.groupby("__d", sort=False)["__y"]
@@ -202,4 +218,3 @@ def build_sample_weights(
         "w_mean": float(np.nanmean(w)),
     }
     return w, st
-

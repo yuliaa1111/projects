@@ -229,12 +229,43 @@ def _transform_payload_with_pca(payload: Dict[str, Any], pca_state: Dict[str, An
     pca = pca_state["pca"]
     pc_cols = list(pca_state["pc_cols"])
 
-    X_in = X.to_numpy()
+    X_in: Any = X
     if scaler is not None:
+        # Keep feature names to avoid sklearn validation warnings.
         X_in = scaler.transform(X_in)
+    if isinstance(X_in, pd.DataFrame):
+        X_in = X_in.to_numpy()
     X_pc = pca.transform(X_in)
     X_df = pd.DataFrame(X_pc, columns=pc_cols, index=X.index)
     return _clone_payload_with_X(payload, X_df, pc_cols)
+
+
+def _pca_state_for_record(pca_state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Keep only parquet/json-friendly PCA state fields for history records.
+    """
+    if not isinstance(pca_state, dict):
+        return {}
+    out: Dict[str, Any] = {}
+    for k in (
+        "enabled",
+        "n_input_features",
+        "n_output_features",
+        "explained_variance_ratio_sum",
+        "pc_cols",
+    ):
+        if k not in pca_state:
+            continue
+        v = pca_state.get(k)
+        if isinstance(v, (np.integer,)):
+            out[k] = int(v)
+        elif isinstance(v, (np.floating,)):
+            out[k] = float(v)
+        elif isinstance(v, list):
+            out[k] = [str(x) for x in v]
+        else:
+            out[k] = v
+    return out
 
 
 def _build_pseudo_train_df(
@@ -1185,8 +1216,8 @@ class RankICRefitRollTrainer:
                     "model_params": dict(current_model_params),
                     "tune_state": dict(tune_state),
                     "pseudo_state_train": dict(pseudo_train_state),
-                    "pca_state_eval": dict(pca_eval_state),
-                    "pca_state_final": dict(pca_final_state),
+                    "pca_state_eval": _pca_state_for_record(pca_eval_state),
+                    "pca_state_final": _pca_state_for_record(pca_final_state),
                     "skipped": False,
                 }
             )
