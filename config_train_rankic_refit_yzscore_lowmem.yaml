@@ -202,7 +202,8 @@ trainer:
       eval_test_days: 3
       prediction_horizon_days: 1
       step_days: null
-      expanding_train: true
+      expanding_train: false
+
       max_train_days: null
 
     # ratio版：
@@ -220,13 +221,17 @@ trainer:
 
     factor_selection:
       enabled: true
+      source: factor_use_flags_csv
+      factor_use_flags_csv_path: "/home/quant/projects/ret_pred/factor_use_flags_v1_new_use.csv"
+      selection_scope: future_only_single_set
+      future_anchor: future_start
+      # source: predictions_pkl
+      # predictions_pkl_path: "/home/quant/projects/predictions.pkl"
       preplan_union_to_dataloader: true    # 预规划并集写回 dataloader.fields，减少读取列
       selection_mode: "single_day_threshold"   # single_day_threshold单日筛选而不是历史聚合| historical_aggregate
       train_test_anchor: "train_start"         # train_start | train_end | test_start test_end | future_start | future_end
 
-      future_anchor: "future_start"   # future 阶段在 future 第一天重选因子
       future_reselect: true
-      predictions_pkl_path: "/home/quant/projects/predictions.pkl"
       rankic_threshold: 0.03    # 单日阈值规则：abs(rankic) >= rankic_threshold
 
       # 下面三个参数在 historical_aggregate 模式才生效，保留兼容

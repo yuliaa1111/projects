@@ -170,18 +170,23 @@ trainer:
       eval_test_days: 20
       prediction_horizon_days: 5
       step_days: null            # null => step = horizon（future block 不重叠）
-      expanding_train: true
+      expanding_train: false
+
       max_train_days: null
 
     # 动态选因子（可选，默认关闭）
     factor_selection:
-      enabled: false
+      enabled: true
+      source: factor_use_flags_csv
+      factor_use_flags_csv_path: "/home/quant/projects/ret_pred/factor_use_flags_v1_new_use.csv"
+      selection_scope: future_only_single_set
+      future_anchor: future_start
+      # source: predictions_pkl
+      # predictions_pkl_path: "/home/quant/projects/predictions.pkl"
       preplan_union_to_dataloader: true  # 阶段2：先算窗口并集并回填到 dataloader.fields，降低 preprocess 宽度
       selection_mode: "single_day_threshold"  # single_day_threshold | historical_aggregate
       train_test_anchor: "train_start"        # train_start | train_end | test_start | test_end | future_start | future_end
-      future_anchor: "future_start"           # future 重选因子锚点
       future_reselect: true                   # true: future 使用重选因子；false: 继承 train/test 因子
-      predictions_pkl_path: "/Users/yulia/Desktop/clickhouse/predictions.pkl"
       rankic_threshold: 0.03
       aggregate: "abs_mean"      # abs_mean | mean_abs
       cutoff_inclusive: true     # 允许使用 <= train_end 的 RankIC（你已确认）

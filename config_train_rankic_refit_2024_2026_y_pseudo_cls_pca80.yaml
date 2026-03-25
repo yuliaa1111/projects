@@ -170,16 +170,21 @@ trainer:
       eval_test_days: 3
       prediction_horizon_days: 1
       step_days: 
-      expanding_train: true
+      expanding_train: false
+
       max_train_days: 
     factor_selection:
       enabled: true
+      source: factor_use_flags_csv
+      factor_use_flags_csv_path: "/home/quant/projects/ret_pred/factor_use_flags_v1_new_use.csv"
+      selection_scope: future_only_single_set
+      future_anchor: future_start
+      # source: predictions_pkl
+      # predictions_pkl_path: "/home/quant/projects/predictions.pkl"
       preplan_union_to_dataloader: true
       selection_mode: single_day_threshold
       train_test_anchor: train_start
-      future_anchor: future_start
       future_reselect: true
-      predictions_pkl_path: "/home/quant/projects/predictions.pkl"
       rankic_threshold: 0.03
       empty_selection_policy: fallback_base_pool
     sample_weighting:

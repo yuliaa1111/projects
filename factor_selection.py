@@ -74,6 +74,54 @@ def load_predictions_pkl(path: str | Path) -> Dict[pd.Timestamp, pd.Series]:
     return out
 
 
+def load_factor_use_flags_csv(
+    path: str | Path,
+    *,
+    date_col: str = "date",
+) -> Dict[pd.Timestamp, pd.Series]:
+    """
+    Load factor use flags CSV.
+
+    Expected structure:
+    - one row per date
+    - date column: `date_col`
+    - factor columns: 0/1 (or numeric/bool coercible)
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"factor_use_flags csv not found: {p}")
+
+    df = pd.read_csv(p)
+    if date_col not in df.columns:
+        raise KeyError(f"factor_use_flags csv missing date column '{date_col}': {p}")
+    if len(df.columns) <= 1:
+        raise ValueError(f"factor_use_flags csv has no factor columns: {p}")
+
+    factor_cols = [str(c) for c in df.columns if str(c) != str(date_col)]
+    d = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    if d.isna().any():
+        n_bad = int(d.isna().sum())
+        raise ValueError(f"factor_use_flags csv has invalid date rows: n_bad={n_bad} | path={p}")
+
+    # keep the latest row when duplicated dates appear
+    tmp = df.copy()
+    tmp[date_col] = d
+    tmp = tmp.drop_duplicates(subset=[date_col], keep="last")
+    tmp = tmp.sort_values(date_col).reset_index(drop=True)
+
+    out: Dict[pd.Timestamp, pd.Series] = {}
+    for _, row in tmp.iterrows():
+        day = pd.Timestamp(row[date_col]).normalize()
+        s = row[factor_cols]
+        s.index = s.index.astype(str)
+        s = pd.to_numeric(s, errors="coerce").fillna(0.0)
+        out[day] = s
+
+    if not out:
+        raise ValueError(f"factor_use_flags csv loaded but empty: {p}")
+    return out
+
+
 def to_rankic_frame(pred_map: Dict[pd.Timestamp, pd.Series]) -> pd.DataFrame:
     """
     Convert mapping(date->Series[factor->rankic]) to long DataFrame: [date, factor, rankic].
@@ -299,6 +347,47 @@ def select_factors_by_day_rankic(
     return selected, state
 
 
+def select_factors_by_use_flags(
+    flag_map: Dict[pd.Timestamp, pd.Series],
+    *,
+    select_date: str | pd.Timestamp,
+    candidate_pool: Optional[Iterable[str]] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Select factors by one-day 0/1 flags from CSV.
+
+    Strict mode:
+    - missing date -> raise ValueError
+    - all-zero (or empty after candidate_pool filter) -> raise ValueError
+    """
+    d = _to_day(select_date)
+    if d not in flag_map:
+        raise ValueError(f"factor_use_flags missing select_date in csv: {str(d.date())}")
+
+    s = flag_map[d]
+    if not isinstance(s, pd.Series):
+        raise TypeError(f"factor_use_flags day payload must be pandas.Series, got: {type(s)}")
+
+    flags = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    flags.index = flags.index.astype(str)
+    active = flags[flags > 0].index.astype(str).tolist()
+
+    if candidate_pool is not None:
+        pool = set(str(x) for x in candidate_pool)
+        active = [f for f in active if f in pool]
+
+    if len(active) == 0:
+        raise ValueError(f"factor_use_flags select_date has no active factors (all 0): {str(d.date())}")
+
+    state: Dict[str, Any] = {
+        "selection_mode": "factor_use_flags_csv",
+        "select_date": str(d.date()),
+        "n_selected": int(len(active)),
+        "selected": list(active),
+    }
+    return list(active), state
+
+
 def select_union_factors_by_rankic(
     pred_map_or_df: Dict[pd.Timestamp, pd.Series] | pd.DataFrame,
     *,
@@ -358,6 +447,52 @@ def select_union_factors_by_rankic(
         "aggregate": str(aggregate),
         "inclusive": bool(inclusive),
         "min_history_days": int(min_history_days),
+        "n_union": int(len(union)),
+        "union_factors": list(union),
+        "by_asof": by_asof,
+        "candidate_pool_size": None if pool_list is None else int(len(pool_list)),
+    }
+    return union, state
+
+
+def select_union_factors_by_use_flags(
+    flag_map: Dict[pd.Timestamp, pd.Series],
+    *,
+    asof_dates: Iterable[str | pd.Timestamp],
+    candidate_pool: Optional[Iterable[str]] = None,
+) -> Tuple[List[str], Dict[str, Any]]:
+    """
+    Build union factor pool from daily use-flag CSV across multiple dates.
+
+    Strict mode inherited from `select_factors_by_use_flags`:
+    any missing date or all-zero date raises ValueError.
+    """
+    dates = sorted(pd.to_datetime(pd.Series(list(asof_dates)).dropna().unique()))
+    if len(dates) == 0:
+        return [], {"n_asof_dates": 0, "n_union": 0, "union_factors": []}
+
+    pool_list = None if candidate_pool is None else [str(x) for x in candidate_pool]
+    union: List[str] = []
+    seen = set()
+    by_asof: List[Dict[str, Any]] = []
+
+    for dt in dates:
+        selected, _ = select_factors_by_use_flags(
+            flag_map,
+            select_date=dt,
+            candidate_pool=pool_list,
+        )
+        for f in selected:
+            if f not in seen:
+                seen.add(f)
+                union.append(f)
+        by_asof.append({"asof_date": str(pd.Timestamp(dt).date()), "n_selected": int(len(selected))})
+
+    state: Dict[str, Any] = {
+        "selection_mode": "factor_use_flags_csv",
+        "n_asof_dates": int(len(dates)),
+        "asof_start": str(pd.Timestamp(dates[0]).date()),
+        "asof_end": str(pd.Timestamp(dates[-1]).date()),
         "n_union": int(len(union)),
         "union_factors": list(union),
         "by_asof": by_asof,

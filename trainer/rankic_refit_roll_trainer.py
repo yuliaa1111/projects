@@ -31,7 +31,13 @@ from .registry import register_trainer
 from .plugins import METRIC_FN, build_saver
 from .rolling_trainer import RollingTrainer
 from ret_pred.cut import datacut_long
-from ret_pred.factor_selection import load_predictions_pkl, select_factors_by_rankic, save_selected_factors_json
+from ret_pred.factor_selection import (
+    load_factor_use_flags_csv,
+    load_predictions_pkl,
+    save_selected_factors_json,
+    select_factors_by_rankic,
+    select_factors_by_use_flags,
+)
 from ret_pred.windowing_rankic_refit_roll import build_rankic_refit_roll_windows
 
 logger = logging.getLogger(__name__)
@@ -430,13 +436,38 @@ class RankICRefitRollTrainer:
         self.pca_cfg = dict(params.get("pca", {}) or {})
         self.pseudo_cls_cfg = dict(params.get("pseudo_classification", {}) or {})
         self.optuna_cfg = dict(params.get("optuna", {}) or {})
+        self.fs_source = str(self.fs_cfg.get("source", "predictions_pkl")).strip().lower()
         self._pred_map = None
+        self._flags_map = None
         if self.fs_enabled:
-            pkl_path = str(self.fs_cfg.get("predictions_pkl_path", ""))
-            if not pkl_path:
-                raise ValueError("factor_selection.enabled=true but factor_selection.predictions_pkl_path is empty")
-            self._pred_map = load_predictions_pkl(pkl_path)
-            logger.info("factor_selection loaded | path=%s | n_dates=%d", pkl_path, int(len(self._pred_map)))
+            if self.fs_source in {"predictions_pkl", "pkl", "rankic_pkl"}:
+                pkl_path = str(self.fs_cfg.get("predictions_pkl_path", ""))
+                if not pkl_path:
+                    raise ValueError(
+                        "factor_selection.source=predictions_pkl but factor_selection.predictions_pkl_path is empty"
+                    )
+                self._pred_map = load_predictions_pkl(pkl_path)
+                logger.info(
+                    "factor_selection loaded | source=predictions_pkl | path=%s | n_dates=%d",
+                    pkl_path,
+                    int(len(self._pred_map)),
+                )
+            elif self.fs_source in {"factor_use_flags_csv", "use_flags_csv"}:
+                csv_path = str(self.fs_cfg.get("factor_use_flags_csv_path", ""))
+                if not csv_path:
+                    raise ValueError(
+                        "factor_selection.source=factor_use_flags_csv but factor_selection.factor_use_flags_csv_path is empty"
+                    )
+                self._flags_map = load_factor_use_flags_csv(csv_path, date_col="date")
+                logger.info(
+                    "factor_selection loaded | source=factor_use_flags_csv | path=%s | n_dates=%d",
+                    csv_path,
+                    int(len(self._flags_map)),
+                )
+            else:
+                raise ValueError(
+                    f"factor_selection.source must be predictions_pkl|factor_use_flags_csv, got: {self.fs_source}"
+                )
 
         # helper trainer (reuse fit/predict/score/save implementations)
         # - tuner/schedule/gate disabled by not using RollingTrainer.run
@@ -477,23 +508,38 @@ class RankICRefitRollTrainer:
         min_selected: int = 0,
         min_selected_mode: str = "none",
     ) -> Tuple[List[str], Dict[str, Any]]:
-        if not self.fs_enabled or self._pred_map is None:
+        if not self.fs_enabled:
             return list(candidate_pool), {"enabled": False, "select_date": str(select_date)[:10], "n_selected": int(len(candidate_pool))}
 
-        selection_mode = str(self.fs_cfg.get("selection_mode", "historical_aggregate"))
-        selected, state = select_factors_by_rankic(
-            self._pred_map,
-            asof_date=select_date,
-            threshold=float(self.fs_cfg.get("rankic_threshold", self.fs_cfg.get("threshold", 0.03))),
-            aggregate=str(self.fs_cfg.get("aggregate", "abs_mean")),
-            inclusive=bool(self.fs_cfg.get("cutoff_inclusive", True)),
-            min_history_days=int(self.fs_cfg.get("min_history_days", 1)),
-            candidate_pool=candidate_pool,
-            selection_mode=selection_mode,
-            min_selected=int(min_selected),
-            min_selected_mode=str(min_selected_mode),
-        )
-        return selected, {"enabled": True, **state}
+        if self.fs_source in {"predictions_pkl", "pkl", "rankic_pkl"}:
+            if self._pred_map is None:
+                raise RuntimeError("factor_selection source=predictions_pkl but map is not loaded")
+            selection_mode = str(self.fs_cfg.get("selection_mode", "historical_aggregate"))
+            selected, state = select_factors_by_rankic(
+                self._pred_map,
+                asof_date=select_date,
+                threshold=float(self.fs_cfg.get("rankic_threshold", self.fs_cfg.get("threshold", 0.03))),
+                aggregate=str(self.fs_cfg.get("aggregate", "abs_mean")),
+                inclusive=bool(self.fs_cfg.get("cutoff_inclusive", True)),
+                min_history_days=int(self.fs_cfg.get("min_history_days", 1)),
+                candidate_pool=candidate_pool,
+                selection_mode=selection_mode,
+                min_selected=int(min_selected),
+                min_selected_mode=str(min_selected_mode),
+            )
+            return selected, {"enabled": True, "source": "predictions_pkl", **state}
+
+        if self.fs_source in {"factor_use_flags_csv", "use_flags_csv"}:
+            if self._flags_map is None:
+                raise RuntimeError("factor_selection source=factor_use_flags_csv but map is not loaded")
+            selected, state = select_factors_by_use_flags(
+                self._flags_map,
+                select_date=select_date,
+                candidate_pool=candidate_pool,
+            )
+            return selected, {"enabled": True, "source": "factor_use_flags_csv", **state}
+
+        raise ValueError(f"unknown factor_selection.source: {self.fs_source}")
 
     def _cut_part(self, part_df: pd.DataFrame, *, feature_cols: List[str], fold: int, part: str) -> Dict[str, Any]:
         cut_cfg = dict(self.cut_cfg_base)

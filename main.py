@@ -393,7 +393,12 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                 if len(planning_dates) == 0:
                     logger.warning("rankic preplan skipped: no planning dates collected from dataloader source.")
                 else:
-                    from ret_pred.factor_selection import load_predictions_pkl, select_union_factors_by_rankic
+                    from ret_pred.factor_selection import (
+                        load_factor_use_flags_csv,
+                        load_predictions_pkl,
+                        select_union_factors_by_rankic,
+                        select_union_factors_by_use_flags,
+                    )
                     from ret_pred.windowing_rankic_refit_roll import build_rankic_refit_roll_windows
 
                     # build preplan specs:
@@ -425,26 +430,13 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                 }
                             )
 
-                    pkl_paths = []
-                    for sp in specs:
-                        fs_i = dict(sp.get("factor_selection", {}) or {})
-                        p = str(fs_i.get("predictions_pkl_path", "")).strip()
-                        if p:
-                            pkl_paths.append(p)
-                    pkl_paths = list(dict.fromkeys(pkl_paths))
-                    if len(pkl_paths) == 0:
-                        raise ValueError(
-                            "factor_selection.preplan_union_to_dataloader=true but predictions_pkl_path is empty"
-                        )
-                    if len(pkl_paths) > 1:
-                        logger.warning("multiple predictions_pkl_path detected in sweep preplan; using first: %s", pkl_paths[0])
-                    pred_map = load_predictions_pkl(pkl_paths[0])
-
                     union_pool: List[str] = []
                     union_seen = set()
                     spec_states: List[Dict[str, Any]] = []
                     any_no_fs = False
                     total_asof_dates = 0
+                    pred_map_cache: Dict[str, Any] = {}
+                    flags_map_cache: Dict[str, Any] = {}
 
                     for sp in specs:
                         fs_i = dict(sp.get("factor_selection", {}) or {})
@@ -481,18 +473,49 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                             preplan_min_selected = int(fs_i.get("future_min_selected", 0))
                             preplan_min_selected_mode = str(fs_i.get("future_min_selected_mode", "none"))
 
-                        pool_i, state_i = select_union_factors_by_rankic(
-                            pred_map,
-                            asof_dates=asof_dates,
-                            threshold=float(fs_i.get("rankic_threshold", fs_i.get("threshold", 0.03))),
-                            aggregate=str(fs_i.get("aggregate", "abs_mean")),
-                            inclusive=bool(fs_i.get("cutoff_inclusive", True)),
-                            min_history_days=int(fs_i.get("min_history_days", 1)),
-                            candidate_pool=base_pool,
-                            selection_mode=selection_mode,
-                            min_selected=int(preplan_min_selected),
-                            min_selected_mode=str(preplan_min_selected_mode),
-                        )
+                        fs_source = str(fs_i.get("source", "predictions_pkl")).strip().lower()
+                        if fs_source in {"predictions_pkl", "pkl", "rankic_pkl"}:
+                            pkl_path = str(fs_i.get("predictions_pkl_path", "")).strip()
+                            if not pkl_path:
+                                raise ValueError(
+                                    "factor_selection.source=predictions_pkl with preplan enabled but "
+                                    "factor_selection.predictions_pkl_path is empty"
+                                )
+                            if pkl_path not in pred_map_cache:
+                                pred_map_cache[pkl_path] = load_predictions_pkl(pkl_path)
+                            pred_map = pred_map_cache[pkl_path]
+                            pool_i, state_i = select_union_factors_by_rankic(
+                                pred_map,
+                                asof_dates=asof_dates,
+                                threshold=float(fs_i.get("rankic_threshold", fs_i.get("threshold", 0.03))),
+                                aggregate=str(fs_i.get("aggregate", "abs_mean")),
+                                inclusive=bool(fs_i.get("cutoff_inclusive", True)),
+                                min_history_days=int(fs_i.get("min_history_days", 1)),
+                                candidate_pool=base_pool,
+                                selection_mode=selection_mode,
+                                min_selected=int(preplan_min_selected),
+                                min_selected_mode=str(preplan_min_selected_mode),
+                            )
+                        elif fs_source in {"factor_use_flags_csv", "use_flags_csv"}:
+                            flags_path = str(fs_i.get("factor_use_flags_csv_path", "")).strip()
+                            if not flags_path:
+                                raise ValueError(
+                                    "factor_selection.source=factor_use_flags_csv with preplan enabled but "
+                                    "factor_selection.factor_use_flags_csv_path is empty"
+                                )
+                            if flags_path not in flags_map_cache:
+                                flags_map_cache[flags_path] = load_factor_use_flags_csv(flags_path, date_col="date")
+                            flags_map = flags_map_cache[flags_path]
+                            pool_i, state_i = select_union_factors_by_use_flags(
+                                flags_map,
+                                asof_dates=asof_dates,
+                                candidate_pool=base_pool,
+                            )
+                        else:
+                            raise ValueError(
+                                f"factor_selection.source must be predictions_pkl|factor_use_flags_csv, got: {fs_source}"
+                            )
+
                         for f in pool_i:
                             if f not in union_seen:
                                 union_seen.add(f)
@@ -510,6 +533,7 @@ def run_train(cfg: Dict[str, Any]) -> Dict[str, Any]:
                                 "future_single_set": bool(future_single_set),
                                 "future_min_selected": int(preplan_min_selected),
                                 "future_min_selected_mode": str(preplan_min_selected_mode),
+                                "source": fs_source,
                                 "n_asof_dates": int(len(asof_dates)),
                                 "n_union": int(len(pool_i)),
                                 "state": state_i,
